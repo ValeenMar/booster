@@ -51,6 +51,14 @@ El botón **Apps de inicio** abre un panel con todo lo que arranca junto con Win
 
 La "memoria standby" es caché que Windows guarda por las dudas; cuando se llena, algunos juegos stutterean al pedir RAM. El botón **Purgar RAM caché** la vacía al instante (lo mismo que hace ISLC), y el modo gaming la purga automáticamente después de cerrar procesos. Es inofensivo: Windows la vuelve a llenar sola con el uso.
 
+## Dashboard con gráfico en vivo 📈
+
+La interfaz es un dashboard oscuro (paleta [Catppuccin Mocha](https://catppuccin.com/)) con:
+
+- **Gráfico de RAM en tiempo real** (últimos 3 minutos, 1 muestra por segundo): la escala hace zoom al rango real de uso, así cuando purgás o cerrás procesos **ves el bajón en vivo**. Cada purga queda marcada con una línea verde y los GB que liberó.
+- **Tarjetas de métricas**: RAM en uso, RAM libre, % de carga (se pone amarillo/rojo si va justa) y total purgado en la sesión.
+- Lectura de memoria vía API nativa (`GlobalMemoryStatusEx`), sin el costo de WMI: el monitoreo no consume nada apreciable.
+
 ## Timer de 0,5 ms ⏱️
 
 El timer por defecto de Windows corre a 15,6 ms; con el checkbox **Timer 0,5 ms** (arriba a la derecha) Booster lo fuerza a la máxima precisión, igual que herramientas como TimerResolution o ISLC. Mejora el frame pacing y la consistencia de frames en varios juegos. Es riesgo cero: dura solo mientras Booster esté abierto — al cerrarlo, Windows lo devuelve al valor normal automáticamente. El modo gaming lo activa solo (dejá Booster abierto mientras jugás).

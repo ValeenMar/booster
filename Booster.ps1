@@ -1,5 +1,5 @@
 ﻿# ============================================================
-#  BOOSTER v5 - Optimizador gaming para despues del trabajo
+#  BOOSTER v6 - Optimizador gaming para despues del trabajo
 #  - Listas con comodines (Adobe* cierra todo lo de Adobe)
 #  - Barrido de procesos de fondo sin ventana
 #  - Pausa servicios de Windows Y de terceros (updaters, etc.)
@@ -12,6 +12,8 @@
 #  - Gestor de apps de inicio (misma mecanica que el Adm. de tareas)
 #  - Purga de memoria standby estilo ISLC
 #  - Auto-modo gaming: detecta juegos y se activa solo (silencioso)
+#  - Dashboard Catppuccin Mocha con grafico de RAM en tiempo real:
+#    las purgas se marcan en verde y se ve el bajon en vivo
 # ============================================================
 #Requires -Version 5.1
 
@@ -83,6 +85,31 @@ public static class BoosterMem {
 }
 "@
 
+# API nativa para leer la RAM cada segundo sin el costo de WMI
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class BoosterRam {
+    [StructLayout(LayoutKind.Sequential)]
+    struct MEMORYSTATUSEX {
+        public uint dwLength; public uint dwMemoryLoad;
+        public ulong ullTotalPhys; public ulong ullAvailPhys;
+        public ulong ullTotalPageFile; public ulong ullAvailPageFile;
+        public ulong ullTotalVirtual; public ulong ullAvailVirtual;
+        public ulong ullAvailExtendedVirtual;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX b);
+    // Devuelve [totalMB, disponibleMB, cargaPct]
+    public static long[] Query() {
+        MEMORYSTATUSEX m = new MEMORYSTATUSEX();
+        m.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+        GlobalMemoryStatusEx(ref m);
+        return new long[] { (long)(m.ullTotalPhys / 1048576), (long)(m.ullAvailPhys / 1048576), (long)m.dwMemoryLoad };
+    }
+}
+"@
+
 # --- Configuración -------------------------------------------
 $script:Dir        = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:ConfigPath = Join-Path $Dir 'config.json'
@@ -120,14 +147,19 @@ foreach ($k in $defaultConfig.Keys) {
     }
 }
 
-# --- Paleta de colores ---------------------------------------
-$colBg     = [System.Drawing.Color]::FromArgb(20, 20, 31)
-$colPanel  = [System.Drawing.Color]::FromArgb(30, 30, 46)
-$colAccent = [System.Drawing.Color]::FromArgb(137, 90, 246)
-$colGreen  = [System.Drawing.Color]::FromArgb(94, 200, 120)
-$colRed    = [System.Drawing.Color]::FromArgb(230, 90, 100)
-$colText   = [System.Drawing.Color]::FromArgb(225, 225, 235)
-$colDim    = [System.Drawing.Color]::FromArgb(140, 140, 160)
+# --- Paleta de colores (Catppuccin Mocha) --------------------
+$colBg      = [System.Drawing.Color]::FromArgb(17, 17, 27)     # crust: fondo de ventana
+$colPanel   = [System.Drawing.Color]::FromArgb(30, 30, 46)     # base: paneles, listas, tarjetas
+$colSurface = [System.Drawing.Color]::FromArgb(49, 50, 68)     # surface0: grilla, botones neutros
+$colAccent  = [System.Drawing.Color]::FromArgb(203, 166, 247)  # mauve
+$colGreen   = [System.Drawing.Color]::FromArgb(166, 227, 161)
+$colRed     = [System.Drawing.Color]::FromArgb(243, 139, 168)
+$colYellow  = [System.Drawing.Color]::FromArgb(249, 226, 175)
+$colBlue    = [System.Drawing.Color]::FromArgb(137, 180, 250)
+$colTeal    = [System.Drawing.Color]::FromArgb(148, 226, 213)
+$colText    = [System.Drawing.Color]::FromArgb(205, 214, 244)
+$colDim     = [System.Drawing.Color]::FromArgb(147, 153, 178)
+$colDark    = [System.Drawing.Color]::FromArgb(17, 17, 27)     # texto sobre botones pastel
 
 # --- Helpers de lógica ----------------------------------------
 function Test-InList([string]$name, $patterns) {
@@ -580,12 +612,21 @@ function Clear-StandbyMemory {
         return
     }
     Start-Sleep -Milliseconds 500
+    $libreDespues = Get-FreeRamMB
+    $liberado = [Math]::Max(0, $libreDespues - $libreAntes)
+    # Marca para el gráfico en vivo: línea verde en el momento exacto
+    # de la purga con los GB liberados
+    $script:PurgadoSesionMB += $liberado
+    if ($null -ne $script:PurgeMarks) {
+        [void]$script:PurgeMarks.Add(@{ Tick = $script:TickNum; Texto = ('-{0:N1} GB' -f ($liberado / 1024)) })
+        if ($script:PurgeMarks.Count -gt 50) { $script:PurgeMarks.RemoveAt(0) }
+    }
     if ($null -ne $antes) {
         Write-Log ("Memoria standby purgada: {0:N0} MB -> {1:N0} MB." -f $antes, (Get-StandbyMB)) 'ok'
     } else {
         # En algunas PCs los contadores de standby no están disponibles:
         # se informa con la RAM libre, que igual refleja el efecto
-        Write-Log ("Memoria standby purgada (RAM libre: {0:N0} MB -> {1:N0} MB)." -f $libreAntes, (Get-FreeRamMB)) 'ok'
+        Write-Log ("Memoria standby purgada (RAM libre: {0:N0} MB -> {1:N0} MB)." -f $libreAntes, $libreDespues) 'ok'
     }
 }
 
@@ -693,7 +734,7 @@ function Show-StartupManager {
     $btnAplicar.Location     = New-Object System.Drawing.Point(15, 450)
     $btnAplicar.Size         = New-Object System.Drawing.Size(220, 36)
     $btnAplicar.BackColor    = $colAccent
-    $btnAplicar.ForeColor    = [System.Drawing.Color]::White
+    $btnAplicar.ForeColor    = $colDark
     $btnAplicar.FlatStyle    = 'Flat'
     $btnAplicar.DialogResult = 'OK'
     $dlg.Controls.Add($btnAplicar)
@@ -793,7 +834,7 @@ function Show-KillPicker($items) {
     $btnOk.Location     = New-Object System.Drawing.Point(15, 430)
     $btnOk.Size         = New-Object System.Drawing.Size(220, 36)
     $btnOk.BackColor    = $colAccent
-    $btnOk.ForeColor    = [System.Drawing.Color]::White
+    $btnOk.ForeColor    = $colDark
     $btnOk.FlatStyle    = 'Flat'
     $btnOk.DialogResult = 'OK'
     $dlg.Controls.Add($btnOk)
@@ -877,56 +918,84 @@ function Invoke-GamingMode([switch]$Silencioso) {
     $script:BoostEnCurso = $false
 }
 
-# --- GUI -------------------------------------------------------
+# --- GUI v6: dashboard con gráfico de RAM en vivo ---------------
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = 'Booster - Optimizador gaming'
-$form.Size            = New-Object System.Drawing.Size(1010, 700)
+$form.Size            = New-Object System.Drawing.Size(1180, 850)
 $form.StartPosition   = 'CenterScreen'
 $form.FormBorderStyle = 'FixedSingle'
 $form.MaximizeBox     = $false
 $form.BackColor       = $colBg
-$form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
+$form.Font            = New-Object System.Drawing.Font('Segoe UI', 9.5)
 
+function Set-Rounded($ctl, [int]$r) {
+    # Esquinas redondeadas via Region (GraphicsPath de 4 arcos)
+    $d = $r * 2
+    $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $gp.AddArc(0, 0, $d, $d, 180, 90)
+    $gp.AddArc($ctl.Width - $d - 1, 0, $d, $d, 270, 90)
+    $gp.AddArc($ctl.Width - $d - 1, $ctl.Height - $d - 1, $d, $d, 0, 90)
+    $gp.AddArc(0, $ctl.Height - $d - 1, $d, $d, 90, 90)
+    $gp.CloseFigure()
+    $ctl.Region = New-Object System.Drawing.Region($gp)
+}
+
+function New-Btn([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $bg, $fg) {
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text      = $text
+    $b.Location  = New-Object System.Drawing.Point($x, $y)
+    $b.Size      = New-Object System.Drawing.Size($w, $h)
+    $b.BackColor = $bg
+    $b.ForeColor = $fg
+    $b.FlatStyle = 'Flat'
+    $b.FlatAppearance.BorderSize = 0
+    $b.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5)
+    $b.Cursor    = 'Hand'
+    Set-Rounded $b 8
+    $form.Controls.Add($b)
+    return $b
+}
+
+function New-Toggle([string]$text, [int]$x, [int]$y, [int]$w) {
+    # Checkbox con pinta de pill/toggle: gris apagado, mauve encendido
+    $t = New-Object System.Windows.Forms.CheckBox
+    $t.Appearance = 'Button'
+    $t.Text       = $text
+    $t.Location   = New-Object System.Drawing.Point($x, $y)
+    $t.Size       = New-Object System.Drawing.Size($w, 36)
+    $t.TextAlign  = 'MiddleCenter'
+    $t.FlatStyle  = 'Flat'
+    $t.FlatAppearance.BorderSize = 0
+    $t.FlatAppearance.CheckedBackColor = $colAccent
+    $t.BackColor  = $colSurface
+    $t.ForeColor  = $colText
+    $t.Cursor     = 'Hand'
+    $t.Add_CheckedChanged({ $this.ForeColor = if ($this.Checked) { $colDark } else { $colText } })
+    Set-Rounded $t 18
+    $form.Controls.Add($t)
+    return $t
+}
+
+# ----- Header -----
 $lblTitle = New-Object System.Windows.Forms.Label
 $lblTitle.Text      = 'BOOSTER'
-$lblTitle.Font      = New-Object System.Drawing.Font('Segoe UI', 22, [System.Drawing.FontStyle]::Bold)
+$lblTitle.Font      = New-Object System.Drawing.Font('Segoe UI', 24, [System.Drawing.FontStyle]::Bold)
 $lblTitle.ForeColor = $colAccent
-$lblTitle.Location  = New-Object System.Drawing.Point(20, 12)
+$lblTitle.Location  = New-Object System.Drawing.Point(24, 8)
 $lblTitle.AutoSize  = $true
 $form.Controls.Add($lblTitle)
 
 $lblSub = New-Object System.Windows.Forms.Label
 $lblSub.Text      = 'Liberá tu PC después del trabajo'
 $lblSub.ForeColor = $colDim
-$lblSub.Location  = New-Object System.Drawing.Point(24, 55)
+$lblSub.Location  = New-Object System.Drawing.Point(28, 52)
 $lblSub.AutoSize  = $true
 $form.Controls.Add($lblSub)
 
-$btnGaming = New-Object System.Windows.Forms.Button
-$btnGaming.Text      = 'MODO GAMING'
-$btnGaming.Font      = New-Object System.Drawing.Font('Segoe UI', 13, [System.Drawing.FontStyle]::Bold)
-$btnGaming.Location  = New-Object System.Drawing.Point(740, 15)
-$btnGaming.Size      = New-Object System.Drawing.Size(230, 58)
-$btnGaming.BackColor = $colAccent
-$btnGaming.ForeColor = [System.Drawing.Color]::White
-$btnGaming.FlatStyle = 'Flat'
-$btnGaming.FlatAppearance.BorderSize = 0
-$btnGaming.Add_Click({ Invoke-GamingMode })
-$form.Controls.Add($btnGaming)
-
-$chkTimer = New-Object System.Windows.Forms.CheckBox
-$chkTimer.Text      = 'Timer 0,5 ms'
-$chkTimer.Location  = New-Object System.Drawing.Point(620, 33)
-$chkTimer.Size      = New-Object System.Drawing.Size(112, 24)
-$chkTimer.ForeColor = $colText
+$chkTimer = New-Toggle 'Timer 0,5 ms' 668 20 138
 $chkTimer.Add_CheckedChanged({ Set-TimerResolution $chkTimer.Checked })
-$form.Controls.Add($chkTimer)
 
-$chkAuto = New-Object System.Windows.Forms.CheckBox
-$chkAuto.Text      = 'Auto-gaming'
-$chkAuto.Location  = New-Object System.Drawing.Point(620, 55)
-$chkAuto.Size      = New-Object System.Drawing.Size(112, 24)
-$chkAuto.ForeColor = $colText
+$chkAuto = New-Toggle 'Auto-gaming' 816 20 138
 $chkAuto.Add_CheckedChanged({
     if ($chkAuto.Checked) {
         Write-Log "Auto-gaming ON: al detectar un juego (lista 'juegos' del config) se activa el modo gaming solo, sin diálogos." 'info'
@@ -934,48 +1003,182 @@ $chkAuto.Add_CheckedChanged({
         Write-Log 'Auto-gaming desactivado.' 'info'
     }
 })
-$form.Controls.Add($chkAuto)
 
-# Detector de juegos: revisa cada 5 segundos si arrancó un juego
-$script:JuegoDetectado = $false
-$script:BoostEnCurso   = $false
-$timerAuto = New-Object System.Windows.Forms.Timer
-$timerAuto.Interval = 5000
-$timerAuto.Add_Tick({
-    if (-not $chkAuto.Checked -or $script:BoostEnCurso) { return }
-    $juego = Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-InList $_.Name $Config.juegos } | Select-Object -First 1
-    if ($juego -and -not $script:JuegoDetectado) {
-        $script:JuegoDetectado = $true
-        Write-Log "Juego detectado: $($juego.Name)" 'title'
-        Invoke-GamingMode -Silencioso
-    } elseif (-not $juego) {
-        $script:JuegoDetectado = $false
+$btnGaming = New-Btn 'MODO GAMING' 966 14 174 48 $colAccent $colDark
+$btnGaming.Font = New-Object System.Drawing.Font('Segoe UI', 11.5, [System.Drawing.FontStyle]::Bold)
+$btnGaming.Add_Click({ Invoke-GamingMode })
+
+# ----- Gráfico de RAM en vivo -----
+$script:RamHist          = New-Object System.Collections.ArrayList
+$script:PurgeMarks       = New-Object System.Collections.ArrayList
+$script:TickNum          = 0
+$script:HistCap          = 180      # 3 minutos de historia a 1 muestra/seg
+$script:PurgadoSesionMB  = 0
+$script:TotalRamMB       = ([BoosterRam]::Query())[0]
+$script:JuegoDetectado   = $false
+$script:BoostEnCurso     = $false
+
+# Recursos GDI creados una sola vez (crearlos en cada Paint filtra handles)
+$script:cFontCap  = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+$script:cFontTiny = New-Object System.Drawing.Font('Segoe UI', 8)
+$script:cFontBig  = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+$script:cBrDim    = New-Object System.Drawing.SolidBrush($colDim)
+$script:cBrAccent = New-Object System.Drawing.SolidBrush($colAccent)
+$script:cBrGreen  = New-Object System.Drawing.SolidBrush($colGreen)
+$script:cBrHalo   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(70, $colAccent))
+$script:cPenGrid  = New-Object System.Drawing.Pen($colSurface, 1)
+$script:cPenLine  = New-Object System.Drawing.Pen($colAccent, 2.2)
+$script:cPenLine.LineJoin = 'Round'
+$script:cPenMark  = New-Object System.Drawing.Pen($colGreen, 1.4)
+$script:cPenMark.DashStyle = 'Dash'
+
+$chartPanel = New-Object System.Windows.Forms.Panel
+$chartPanel.Location  = New-Object System.Drawing.Point(24, 78)
+$chartPanel.Size      = New-Object System.Drawing.Size(1116, 190)
+$chartPanel.BackColor = $colPanel
+Set-Rounded $chartPanel 12
+# DoubleBuffered es protected en Panel: se activa por reflexión para que no parpadee
+[System.Windows.Forms.Panel].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($chartPanel, $true, $null)
+$form.Controls.Add($chartPanel)
+
+$chartPanel.Add_Paint({
+    param($sender, $e)
+    $g = $e.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $W = $sender.ClientSize.Width; $H = $sender.ClientSize.Height
+    $padL = 18; $padR = 84; $padT = 42; $padB = 16
+    $plotW = $W - $padL - $padR; $plotH = $H - $padT - $padB
+
+    # Título + leyenda de purgas
+    $g.DrawString('RAM EN VIVO', $cFontCap, $cBrDim, 18, 13)
+    $g.DrawLine($cPenMark, 118, 21, 140, 21)
+    $g.DrawString('purga', $cFontTiny, $cBrGreen, 144, 14)
+
+    $hist = @($script:RamHist)
+    if ($hist.Count -ge 1) {
+        # Valor actual grande, arriba a la derecha
+        $ultimo = $hist[$hist.Count - 1]
+        $txt = ('{0:N1} GB' -f ($ultimo.UsedMB / 1024))
+        $szB = $g.MeasureString($txt, $cFontBig)
+        $g.DrawString($txt, $cFontBig, $cBrAccent, $W - 18 - $szB.Width, 6)
+        $sub = ('en uso de {0:N0} GB' -f ($script:TotalRamMB / 1024))
+        $szS = $g.MeasureString($sub, $cFontTiny)
+        $g.DrawString($sub, $cFontTiny, $cBrDim, $W - 18 - $szS.Width, 6 + $szB.Height - 5)
+    }
+    if ($hist.Count -lt 2) {
+        $g.DrawString('Recolectando datos...', $cFontCap, $cBrDim, $padL, $padT + $plotH / 2)
+        return
+    }
+
+    # Escala Y dinámica: zoom al rango real para que las purgas se VEAN
+    $vals = $hist | ForEach-Object { $_.UsedMB }
+    $minV = ($vals | Measure-Object -Minimum).Minimum
+    $maxV = ($vals | Measure-Object -Maximum).Maximum
+    $rango = [Math]::Max($maxV - $minV, $script:TotalRamMB * 0.04)
+    $yMin = [Math]::Max(0, $minV - $rango * 0.25)
+    $yMax = $maxV + $rango * 0.25
+
+    # Grilla horizontal con etiquetas en GB
+    for ($i = 0; $i -le 3; $i++) {
+        $y = $padT + $plotH * $i / 3
+        $g.DrawLine($cPenGrid, $padL, $y, $padL + $plotW, $y)
+        $v = $yMax - ($yMax - $yMin) * $i / 3
+        $g.DrawString(('{0:N1} GB' -f ($v / 1024)), $cFontTiny, $cBrDim, $padL + $plotW + 8, $y - 8)
+    }
+
+    # Puntos de la curva (ventana fija anclada a la derecha, avanza como ticker)
+    $lastTick = $hist[$hist.Count - 1].Tick
+    $firstTick = $hist[0].Tick
+    $step = $plotW / [Math]::Max(1, ($script:HistCap - 1))
+    $pts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+    foreach ($m in $hist) {
+        $x = $padL + $plotW - ($lastTick - $m.Tick) * $step
+        $frac = ($m.UsedMB - $yMin) / ($yMax - $yMin)
+        $y = $padT + $plotH * (1 - $frac)
+        $pts.Add((New-Object System.Drawing.PointF($x, $y)))
+    }
+
+    # Área bajo la curva con gradiente mauve -> transparente
+    $area = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $area.AddLines($pts.ToArray())
+    $area.AddLine($pts[$pts.Count - 1].X, $padT + $plotH, $pts[0].X, $padT + $plotH)
+    $area.CloseFigure()
+    $rect = New-Object System.Drawing.RectangleF($padL, $padT, $plotW, $plotH + 1)
+    $grad = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, [System.Drawing.Color]::FromArgb(105, $colAccent), [System.Drawing.Color]::FromArgb(0, $colAccent), 90.0)
+    $g.FillPath($grad, $area)
+    $grad.Dispose(); $area.Dispose()
+
+    # Línea principal + punto vivo con halo
+    $g.DrawLines($cPenLine, $pts.ToArray())
+    $pu = $pts[$pts.Count - 1]
+    $g.FillEllipse($cBrHalo, $pu.X - 7, $pu.Y - 7, 14, 14)
+    $g.FillEllipse($cBrAccent, $pu.X - 3.5, $pu.Y - 3.5, 7, 7)
+
+    # Marcas de purga: línea vertical verde + GB liberados
+    foreach ($mk in @($script:PurgeMarks)) {
+        if ($mk.Tick -lt $firstTick) { continue }
+        $x = $padL + $plotW - ($lastTick - $mk.Tick) * $step
+        $g.DrawLine($cPenMark, $x, $padT, $x, $padT + $plotH)
+        $lbl = 'PURGA ' + $mk.Texto
+        $sz = $g.MeasureString($lbl, $cFontTiny)
+        $lx = [Math]::Max($padL, [Math]::Min($x - $sz.Width / 2, $padL + $plotW - $sz.Width))
+        $g.DrawString($lbl, $cFontTiny, $cBrGreen, $lx, $padT - 16)
     }
 })
-$timerAuto.Start()
+
+# ----- Tarjetas de métricas -----
+function New-Card([string]$caption, [int]$x, $valColor) {
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Location  = New-Object System.Drawing.Point($x, 280)
+    $p.Size      = New-Object System.Drawing.Size(270, 66)
+    $p.BackColor = $colPanel
+    Set-Rounded $p 10
+    $cap = New-Object System.Windows.Forms.Label
+    $cap.Text      = $caption
+    $cap.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.25)
+    $cap.ForeColor = $colDim
+    $cap.Location  = New-Object System.Drawing.Point(14, 9)
+    $cap.AutoSize  = $true
+    $p.Controls.Add($cap)
+    $val = New-Object System.Windows.Forms.Label
+    $val.Text      = '—'
+    $val.Font      = New-Object System.Drawing.Font('Segoe UI', 15, [System.Drawing.FontStyle]::Bold)
+    $val.ForeColor = $valColor
+    $val.Location  = New-Object System.Drawing.Point(12, 27)
+    $val.AutoSize  = $true
+    $p.Controls.Add($val)
+    $form.Controls.Add($p)
+    return $val
+}
+
+$lblCardUsada = New-Card 'RAM EN USO'            24  $colAccent
+$lblCardLibre = New-Card 'RAM LIBRE'             306 $colGreen
+$lblCardCarga = New-Card 'CARGA DE MEMORIA'      588 $colText
+$lblCardPurga = New-Card 'PURGADO ESTA SESIÓN'   870 $colTeal
 
 # ----- Panel de procesos -----
 $lblProc = New-Object System.Windows.Forms.Label
-$lblProc.Text      = 'Procesos que más consumen (tildá y cerrá los que quieras)'
-$lblProc.ForeColor = $colText
-$lblProc.Location  = New-Object System.Drawing.Point(20, 90)
+$lblProc.Text      = 'PROCESOS TRAGONES'
+$lblProc.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+$lblProc.ForeColor = $colDim
+$lblProc.Location  = New-Object System.Drawing.Point(24, 360)
 $lblProc.AutoSize  = $true
 $form.Controls.Add($lblProc)
 
 $lvProc = New-Object System.Windows.Forms.ListView
-$lvProc.Location      = New-Object System.Drawing.Point(20, 115)
-$lvProc.Size          = New-Object System.Drawing.Size(580, 340)
+$lvProc.Location      = New-Object System.Drawing.Point(24, 382)
+$lvProc.Size          = New-Object System.Drawing.Size(690, 236)
 $lvProc.View          = 'Details'
 $lvProc.CheckBoxes    = $true
 $lvProc.FullRowSelect = $true
 $lvProc.BackColor     = $colPanel
 $lvProc.ForeColor     = $colText
-$lvProc.BorderStyle   = 'FixedSingle'
-[void]$lvProc.Columns.Add('Proceso', 190)
-[void]$lvProc.Columns.Add('Instancias', 75)
-[void]$lvProc.Columns.Add('RAM (MB)', 100)
-[void]$lvProc.Columns.Add('CPU (%)', 80)
-[void]$lvProc.Columns.Add('Fondo', 60)
+$lvProc.BorderStyle   = 'None'
+[void]$lvProc.Columns.Add('Proceso', 250)
+[void]$lvProc.Columns.Add('Instancias', 85)
+[void]$lvProc.Columns.Add('RAM (MB)', 110)
+[void]$lvProc.Columns.Add('CPU (%)', 85)
+[void]$lvProc.Columns.Add('Fondo', 70)
 $form.Controls.Add($lvProc)
 
 function Refresh-ProcessList {
@@ -993,74 +1196,27 @@ function Refresh-ProcessList {
     $form.Cursor = 'Default'
 }
 
-$btnRefresh = New-Object System.Windows.Forms.Button
-$btnRefresh.Text      = 'Actualizar'
-$btnRefresh.Location  = New-Object System.Drawing.Point(20, 465)
-$btnRefresh.Size      = New-Object System.Drawing.Size(130, 34)
-$btnRefresh.BackColor = $colPanel
-$btnRefresh.ForeColor = $colText
-$btnRefresh.FlatStyle = 'Flat'
-$btnRefresh.Add_Click({ Refresh-ProcessList })
-$form.Controls.Add($btnRefresh)
-
-$btnKill = New-Object System.Windows.Forms.Button
-$btnKill.Text      = 'Cerrar seleccionados'
-$btnKill.Location  = New-Object System.Drawing.Point(160, 465)
-$btnKill.Size      = New-Object System.Drawing.Size(180, 34)
-$btnKill.BackColor = $colRed
-$btnKill.ForeColor = [System.Drawing.Color]::White
-$btnKill.FlatStyle = 'Flat'
-$btnKill.Add_Click({
-    $marcados = @($lvProc.CheckedItems | ForEach-Object { $_.Text })
-    if ($marcados.Count -eq 0) {
-        Write-Log 'No hay procesos tildados.' 'warn'
-        return
-    }
-    foreach ($name in $marcados) { Close-ProcessByName $name }
-    Refresh-ProcessList
-})
-$form.Controls.Add($btnKill)
-
-$btnPurge = New-Object System.Windows.Forms.Button
-$btnPurge.Text      = 'Purgar RAM caché'
-$btnPurge.Location  = New-Object System.Drawing.Point(350, 465)
-$btnPurge.Size      = New-Object System.Drawing.Size(130, 34)
-$btnPurge.BackColor = $colPanel
-$btnPurge.ForeColor = $colText
-$btnPurge.FlatStyle = 'Flat'
-$btnPurge.Add_Click({ Clear-StandbyMemory })
-$form.Controls.Add($btnPurge)
-
-$btnStartup = New-Object System.Windows.Forms.Button
-$btnStartup.Text      = 'Apps de inicio'
-$btnStartup.Location  = New-Object System.Drawing.Point(490, 465)
-$btnStartup.Size      = New-Object System.Drawing.Size(110, 34)
-$btnStartup.BackColor = $colPanel
-$btnStartup.ForeColor = $colText
-$btnStartup.FlatStyle = 'Flat'
-$btnStartup.Add_Click({ Show-StartupManager })
-$form.Controls.Add($btnStartup)
-
 # ----- Panel de servicios -----
 $lblSvc = New-Object System.Windows.Forms.Label
-$lblSvc.Text      = 'Servicios (Windows + terceros detectados)'
-$lblSvc.ForeColor = $colText
-$lblSvc.Location  = New-Object System.Drawing.Point(620, 90)
+$lblSvc.Text      = 'SERVICIOS (WINDOWS + TERCEROS)'
+$lblSvc.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+$lblSvc.ForeColor = $colDim
+$lblSvc.Location  = New-Object System.Drawing.Point(730, 360)
 $lblSvc.AutoSize  = $true
 $form.Controls.Add($lblSvc)
 
 $lvSvc = New-Object System.Windows.Forms.ListView
-$lvSvc.Location      = New-Object System.Drawing.Point(620, 115)
-$lvSvc.Size          = New-Object System.Drawing.Size(350, 300)
+$lvSvc.Location      = New-Object System.Drawing.Point(730, 382)
+$lvSvc.Size          = New-Object System.Drawing.Size(410, 236)
 $lvSvc.View          = 'Details'
 $lvSvc.CheckBoxes    = $true
 $lvSvc.FullRowSelect = $true
 $lvSvc.BackColor     = $colPanel
 $lvSvc.ForeColor     = $colText
-$lvSvc.BorderStyle   = 'FixedSingle'
-[void]$lvSvc.Columns.Add('Servicio', 175)
-[void]$lvSvc.Columns.Add('Estado', 80)
-[void]$lvSvc.Columns.Add('Origen', 70)
+$lvSvc.BorderStyle   = 'None'
+[void]$lvSvc.Columns.Add('Servicio', 205)
+[void]$lvSvc.Columns.Add('Estado', 90)
+[void]$lvSvc.Columns.Add('Origen', 80)
 $form.Controls.Add($lvSvc)
 
 function Refresh-ServiceList {
@@ -1097,13 +1253,28 @@ function Refresh-ServiceList {
     }
 }
 
-$btnSvcStop = New-Object System.Windows.Forms.Button
-$btnSvcStop.Text      = 'Pausar tildados'
-$btnSvcStop.Location  = New-Object System.Drawing.Point(620, 425)
-$btnSvcStop.Size      = New-Object System.Drawing.Size(165, 34)
-$btnSvcStop.BackColor = $colPanel
-$btnSvcStop.ForeColor = $colText
-$btnSvcStop.FlatStyle = 'Flat'
+# ----- Botonera -----
+$btnRefresh = New-Btn 'Actualizar' 24 628 110 36 $colSurface $colText
+$btnRefresh.Add_Click({ Refresh-ProcessList })
+
+$btnKill = New-Btn 'Cerrar seleccionados' 142 628 170 36 $colRed $colDark
+$btnKill.Add_Click({
+    $marcados = @($lvProc.CheckedItems | ForEach-Object { $_.Text })
+    if ($marcados.Count -eq 0) {
+        Write-Log 'No hay procesos tildados.' 'warn'
+        return
+    }
+    foreach ($name in $marcados) { Close-ProcessByName $name }
+    Refresh-ProcessList
+})
+
+$btnPurge = New-Btn 'Purgar RAM caché' 320 628 150 36 $colTeal $colDark
+$btnPurge.Add_Click({ Clear-StandbyMemory })
+
+$btnStartup = New-Btn 'Apps de inicio' 478 628 130 36 $colSurface $colText
+$btnStartup.Add_Click({ Show-StartupManager })
+
+$btnSvcStop = New-Btn 'Pausar tildados' 730 628 130 36 $colSurface $colText
 $btnSvcStop.Add_Click({
     $marcados = @($lvSvc.CheckedItems | ForEach-Object { $_.Text })
     if ($marcados.Count -eq 0) {
@@ -1113,65 +1284,35 @@ $btnSvcStop.Add_Click({
     [void](Stop-ServicesByName $marcados)
     Refresh-ServiceList
 })
-$form.Controls.Add($btnSvcStop)
 
-$btnSvcStart = New-Object System.Windows.Forms.Button
-$btnSvcStart.Text      = 'Restaurar todo'
-$btnSvcStart.Location  = New-Object System.Drawing.Point(800, 425)
-$btnSvcStart.Size      = New-Object System.Drawing.Size(170, 34)
-$btnSvcStart.BackColor = $colPanel
-$btnSvcStart.ForeColor = $colText
-$btnSvcStart.FlatStyle = 'Flat'
+$btnSvcStart = New-Btn 'Restaurar todo' 868 628 130 36 $colSurface $colText
 $btnSvcStart.Add_Click({ Restore-Services })
-$form.Controls.Add($btnSvcStart)
 
-# ----- Botones de red -----
-$btnNetOpt = New-Object System.Windows.Forms.Button
-$btnNetOpt.Text      = 'Optimizar PC'
-$btnNetOpt.Location  = New-Object System.Drawing.Point(620, 465)
-$btnNetOpt.Size      = New-Object System.Drawing.Size(115, 34)
-$btnNetOpt.BackColor = $colAccent
-$btnNetOpt.ForeColor = [System.Drawing.Color]::White
-$btnNetOpt.FlatStyle = 'Flat'
-$btnNetOpt.FlatAppearance.BorderSize = 0
-$btnNetOpt.Add_Click({ Optimize-System })
-$form.Controls.Add($btnNetOpt)
-
-$btnNetUndo = New-Object System.Windows.Forms.Button
-$btnNetUndo.Text      = 'Revertir tweaks'
-$btnNetUndo.Location  = New-Object System.Drawing.Point(745, 465)
-$btnNetUndo.Size      = New-Object System.Drawing.Size(115, 34)
-$btnNetUndo.BackColor = $colPanel
-$btnNetUndo.ForeColor = $colText
-$btnNetUndo.FlatStyle = 'Flat'
-$btnNetUndo.Add_Click({ Restore-Tweaks })
-$form.Controls.Add($btnNetUndo)
-
-$btnPing = New-Object System.Windows.Forms.Button
-$btnPing.Text      = 'Test ping'
-$btnPing.Location  = New-Object System.Drawing.Point(870, 465)
-$btnPing.Size      = New-Object System.Drawing.Size(100, 34)
-$btnPing.BackColor = $colPanel
-$btnPing.ForeColor = $colText
-$btnPing.FlatStyle = 'Flat'
+$btnPing = New-Btn 'Test ping' 1006 628 134 36 $colBlue $colDark
 $btnPing.Add_Click({ Test-PingLatency })
-$form.Controls.Add($btnPing)
+
+$btnNetOpt = New-Btn 'Optimizar PC' 730 672 200 36 $colAccent $colDark
+$btnNetOpt.Add_Click({ Optimize-System })
+
+$btnNetUndo = New-Btn 'Revertir tweaks' 938 672 202 36 $colSurface $colText
+$btnNetUndo.Add_Click({ Restore-Tweaks })
 
 # ----- Registro -----
 $lblLog = New-Object System.Windows.Forms.Label
-$lblLog.Text      = 'Registro'
+$lblLog.Text      = 'REGISTRO'
+$lblLog.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
 $lblLog.ForeColor = $colDim
-$lblLog.Location  = New-Object System.Drawing.Point(20, 508)
+$lblLog.Location  = New-Object System.Drawing.Point(24, 678)
 $lblLog.AutoSize  = $true
 $form.Controls.Add($lblLog)
 
 $logBox = New-Object System.Windows.Forms.RichTextBox
-$logBox.Location    = New-Object System.Drawing.Point(20, 530)
-$logBox.Size        = New-Object System.Drawing.Size(950, 115)
+$logBox.Location    = New-Object System.Drawing.Point(24, 700)
+$logBox.Size        = New-Object System.Drawing.Size(1116, 100)
 $logBox.ReadOnly    = $true
 $logBox.BackColor   = $colPanel
 $logBox.ForeColor   = $colText
-$logBox.BorderStyle = 'FixedSingle'
+$logBox.BorderStyle = 'None'
 $logBox.Font        = New-Object System.Drawing.Font('Consolas', 9)
 $form.Controls.Add($logBox)
 
@@ -1179,7 +1320,7 @@ function Write-Log([string]$msg, [string]$kind = 'info') {
     $color = switch ($kind) {
         'ok'    { $colGreen }
         'err'   { $colRed }
-        'warn'  { [System.Drawing.Color]::FromArgb(230, 200, 90) }
+        'warn'  { $colYellow }
         'title' { $colAccent }
         default { $colDim }
     }
@@ -1190,11 +1331,52 @@ function Write-Log([string]$msg, [string]$kind = 'info') {
     [System.Windows.Forms.Application]::DoEvents()
 }
 
+# ----- Timer del dashboard: muestrea RAM 1/seg y anima el gráfico -----
+function Update-Dashboard {
+    $q = [BoosterRam]::Query()
+    $script:TotalRamMB = $q[0]
+    $usada = $q[0] - $q[1]
+    $script:TickNum++
+    [void]$script:RamHist.Add([pscustomobject]@{ Tick = $script:TickNum; UsedMB = $usada })
+    while ($script:RamHist.Count -gt $script:HistCap) { $script:RamHist.RemoveAt(0) }
+
+    $lblCardUsada.Text = '{0:N1} GB' -f ($usada / 1024)
+    $lblCardLibre.Text = '{0:N1} GB' -f ($q[1] / 1024)
+    $lblCardCarga.Text = '{0}%' -f $q[2]
+    $lblCardCarga.ForeColor = if ($q[2] -ge 85) { $colRed } elseif ($q[2] -ge 70) { $colYellow } else { $colText }
+    $lblCardPurga.Text = if ($script:PurgadoSesionMB -ge 1024) { '{0:N1} GB' -f ($script:PurgadoSesionMB / 1024) } else { '{0:N0} MB' -f $script:PurgadoSesionMB }
+
+    $chartPanel.Invalidate()
+}
+
+function Test-AutoGaming {
+    if (-not $chkAuto.Checked -or $script:BoostEnCurso) { return }
+    $juego = Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-InList $_.Name $Config.juegos } | Select-Object -First 1
+    if ($juego -and -not $script:JuegoDetectado) {
+        $script:JuegoDetectado = $true
+        Write-Log "Juego detectado: $($juego.Name)" 'title'
+        Invoke-GamingMode -Silencioso
+    } elseif (-not $juego) {
+        $script:JuegoDetectado = $false
+    }
+}
+
+$timerUI = New-Object System.Windows.Forms.Timer
+$timerUI.Interval = 1000
+$timerUI.Add_Tick({
+    Update-Dashboard
+    if ($script:TickNum % 5 -eq 0) { Test-AutoGaming }
+})
+
 # --- Arranque --------------------------------------------------
 $form.Add_Shown({
-    Write-Log 'Booster v5 listo. Tildá Auto-gaming para que se active solo al detectar un juego.' 'title'
+    Update-Dashboard
+    $timerUI.Start()
+    Write-Log 'Booster v6 listo. Mirá el gráfico: cuando purgues la RAM vas a ver el bajón en vivo.' 'title'
     Refresh-ServiceList
     Refresh-ProcessList
 })
+
+$form.Add_FormClosed({ $timerUI.Stop() })
 
 [void]$form.ShowDialog()
