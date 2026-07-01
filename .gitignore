@@ -1,2 +1,4 @@
 # Estado temporal de servicios pausados (se genera al usar la app)
 .booster_state.json
+# Backup de los valores de registro previos a Optimizar red
+.booster_net_backup.json

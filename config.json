@@ -39,7 +39,10 @@
     "SysMain",
     "WSearch",
     "DiagTrack",
-    "Spooler"
+    "Spooler",
+    "BITS",
+    "DoSvc",
+    "wuauserv"
   ],
   "serviciosTercerosAuto": [
     "Adobe*",

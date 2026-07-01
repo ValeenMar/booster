@@ -1,9 +1,11 @@
 ﻿# ============================================================
-#  BOOSTER v2 - Optimizador gaming para despues del trabajo
+#  BOOSTER v3 - Optimizador gaming para despues del trabajo
 #  - Listas con comodines (Adobe* cierra todo lo de Adobe)
 #  - Barrido de procesos de fondo sin ventana
 #  - Pausa servicios de Windows Y de terceros (updaters, etc.)
 #  - Protege anticheats, drivers de GPU/audio/perifericos
+#  - Modulo de red: menos latencia (Nagle, throttling, DNS)
+#    con backup de los valores originales y boton de revertir
 # ============================================================
 #Requires -Version 5.1
 
@@ -21,13 +23,14 @@ Add-Type -AssemblyName System.Drawing
 # --- Configuración -------------------------------------------
 $script:Dir        = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:ConfigPath = Join-Path $Dir 'config.json'
-$script:StatePath  = Join-Path $Dir '.booster_state.json'
+$script:StatePath     = Join-Path $Dir '.booster_state.json'
+$script:NetBackupPath = Join-Path $Dir '.booster_net_backup.json'
 
 # Todas las listas de procesos/servicios aceptan comodines: 'Adobe*'
 $defaultConfig = [ordered]@{
     cerrarSiempre       = @('OneDrive','Teams','ms-teams','Slack','Zoom','Skype','Dropbox','GoogleDriveFS','Adobe*','Acro*','CCX*','Creative Cloud*','CoreSync','Copilot','Widgets','PhoneExperienceHost','YourPhone')
     preguntarAntes      = @('chrome','msedge','firefox','brave','opera','Discord','Spotify','WhatsApp','Telegram','steam','EpicGamesLauncher','Battle.net','RiotClient*','GalaxyClient*','Parsec')
-    serviciosPausables  = @('SysMain','WSearch','DiagTrack','Spooler')
+    serviciosPausables  = @('SysMain','WSearch','DiagTrack','Spooler','BITS','DoSvc','wuauserv')
     serviciosTercerosAuto = @('Adobe*','AGSService','AGMService','*Update*','*update*','gupdate*','edgeupdate*','Bonjour*','TeamViewer*','AnyDesk*','SQLWriter','ClickToRunSvc')
     serviciosProtegidos = @('WinDefend','WdNisSvc','MDCoreSvc','Sense','*Defender*','Nv*','NVDisplay*','AMD*','Rtk*','Realtek*','*Audio*','vgc','vgk','EasyAntiCheat*','BEService*','FACEIT*','ESEA*','ExitLag*','Cowork*','Claude*')
     protegidos          = @('explorer','dwm','csrss','winlogon','services','lsass','svchost','System','Idle','Registry','smss','wininit','fontdrvhost','sihost','ctfmon','conhost','RuntimeBroker','ShellExperienceHost','StartMenuExperienceHost','SearchHost','TextInputHost','ApplicationFrameHost','SecurityHealth*','MsMpEng','NisSrv','audiodg','taskhostw','WmiPrvSE','dllhost','powershell','pwsh','WindowsTerminal','cmd','OpenConsole','msedgewebview2','claude*','Cowork*','nv*','NVIDIA*','amd*','Radeon*','Rtk*','Realtek*','lghub*','Logi*','Razer*','iCUE*','Corsair*','SteelSeries*','EasyAntiCheat*','BEService*','vgc','vgk','vgtray','vanguard*','FACEIT*','ExitLag*')
@@ -209,6 +212,121 @@ function Restore-Services {
     Refresh-ServiceList
 }
 
+# --- Módulo de red: bajar latencia -----------------------------
+$script:SPKeyPS  = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+$script:SPKeyReg = 'HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+$script:IfRoot   = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces'
+
+function Get-RegValueOrNull($path, $name) {
+    $p = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+    if ($p -and $p.PSObject.Properties.Name -contains $name) { return $p.$name }
+    return $null
+}
+
+function Optimize-Network {
+    if (Test-Path $NetBackupPath) {
+        Write-Log "La optimización de red ya estaba aplicada (usá 'Revertir red' para deshacerla)." 'warn'
+        return
+    }
+    $backup = [ordered]@{ systemProfile = [ordered]@{}; interfaces = [ordered]@{} }
+
+    # 1) Desactivar el throttling de red que Windows aplica cuando hay multimedia.
+    #    Si un valor ya está igual o mejor (otro tweak previo), no se toca.
+    $nti = Get-RegValueOrNull $SPKeyPS 'NetworkThrottlingIndex'
+    $sr  = Get-RegValueOrNull $SPKeyPS 'SystemResponsiveness'
+    $backup.systemProfile.NetworkThrottlingIndex = $nti
+    $backup.systemProfile.SystemResponsiveness   = $sr
+    if ($nti -eq 4294967295) {
+        Write-Log 'Throttling de red ya estaba desactivado, no se toca.' 'info'
+    } else {
+        reg.exe add $SPKeyReg /v NetworkThrottlingIndex /t REG_DWORD /d 4294967295 /f | Out-Null
+        Write-Log 'Throttling de red de Windows desactivado.' 'ok'
+    }
+    if ($null -ne $sr -and $sr -le 10) {
+        Write-Log "SystemResponsiveness ya estaba en $sr (igual o mejor), no se toca." 'info'
+    } else {
+        reg.exe add $SPKeyReg /v SystemResponsiveness /t REG_DWORD /d 10 /f | Out-Null
+        Write-Log 'Prioridad multimedia ajustada (SystemResponsiveness = 10).' 'ok'
+    }
+
+    # 2) Desactivar algoritmo de Nagle y delayed ACK en las interfaces con IP
+    #    (Nagle agrupa paquetes chicos antes de mandarlos: bueno para descargas,
+    #     malo para el ping en juegos)
+    $n = 0
+    foreach ($iface in (Get-ChildItem $IfRoot)) {
+        $props = Get-ItemProperty $iface.PSPath
+        $tieneIp = ($props.PSObject.Properties.Name -contains 'DhcpIPAddress' -and $props.DhcpIPAddress) -or
+                   ($props.PSObject.Properties.Name -contains 'IPAddress' -and $props.IPAddress -and $props.IPAddress[0])
+        if (-not $tieneIp) { continue }
+        $backup.interfaces[$iface.PSChildName] = [ordered]@{
+            TcpAckFrequency = Get-RegValueOrNull $iface.PSPath 'TcpAckFrequency'
+            TCPNoDelay      = Get-RegValueOrNull $iface.PSPath 'TCPNoDelay'
+        }
+        Set-ItemProperty -Path $iface.PSPath -Name TcpAckFrequency -Value 1 -Type DWord
+        Set-ItemProperty -Path $iface.PSPath -Name TCPNoDelay -Value 1 -Type DWord
+        $n++
+    }
+    Write-Log "Nagle/delayed ACK desactivados en $n interfaz(es) de red." 'ok'
+
+    ConvertTo-Json -InputObject $backup -Depth 5 | Set-Content $NetBackupPath -Encoding UTF8
+
+    # 3) Limpiar caché DNS
+    ipconfig /flushdns | Out-Null
+    Write-Log 'Caché DNS limpiada.' 'ok'
+    Write-Log 'Los cambios de registro terminan de aplicarse al reiniciar la PC.' 'info'
+}
+
+function Restore-Network {
+    if (-not (Test-Path $NetBackupPath)) {
+        Write-Log 'No hay optimización de red aplicada para revertir.' 'warn'
+        return
+    }
+    $backup = Get-Content $NetBackupPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($name in 'NetworkThrottlingIndex','SystemResponsiveness') {
+        $val = $backup.systemProfile.$name
+        if ($null -eq $val) {
+            Remove-ItemProperty -Path $SPKeyPS -Name $name -ErrorAction SilentlyContinue
+        } else {
+            reg.exe add $SPKeyReg /v $name /t REG_DWORD /d ([uint32]$val) /f | Out-Null
+        }
+    }
+    foreach ($ifName in $backup.interfaces.PSObject.Properties.Name) {
+        $ifPath = Join-Path $IfRoot $ifName
+        if (-not (Test-Path $ifPath)) { continue }
+        $vals = $backup.interfaces.$ifName
+        foreach ($name in 'TcpAckFrequency','TCPNoDelay') {
+            if ($null -eq $vals.$name) {
+                Remove-ItemProperty -Path $ifPath -Name $name -ErrorAction SilentlyContinue
+            } else {
+                Set-ItemProperty -Path $ifPath -Name $name -Value ([int]$vals.$name) -Type DWord
+            }
+        }
+    }
+    Remove-Item $NetBackupPath -Force
+    Write-Log 'Configuración de red revertida a los valores originales (se completa al reiniciar).' 'ok'
+}
+
+function Test-PingLatency {
+    $form.Cursor = 'WaitCursor'
+    Write-Log 'Midiendo latencia, dame unos segundos...' 'title'
+    foreach ($target in @('1.1.1.1', '8.8.8.8')) {
+        $res = Test-Connection -ComputerName $target -Count 6 -ErrorAction SilentlyContinue
+        if (-not $res) {
+            Write-Log "${target}: sin respuesta" 'err'
+            continue
+        }
+        $times = @($res | ForEach-Object { $_.ResponseTime })
+        $avg = [Math]::Round(($times | Measure-Object -Average).Average, 1)
+        $min = ($times | Measure-Object -Minimum).Minimum
+        $max = ($times | Measure-Object -Maximum).Maximum
+        $jitter = 0.0
+        for ($i = 1; $i -lt $times.Count; $i++) { $jitter += [Math]::Abs($times[$i] - $times[$i - 1]) }
+        if ($times.Count -gt 1) { $jitter = [Math]::Round($jitter / ($times.Count - 1), 1) }
+        Write-Log ("{0}: {1} ms promedio (min {2} / max {3}), jitter {4} ms" -f $target, $avg, $min, $max, $jitter) 'ok'
+    }
+    $form.Cursor = 'Default'
+}
+
 function Show-KillPicker($items) {
     # Dialogo del "modo mixto": apps abiertas + procesos de fondo
     # detectados. Devuelve los nombres tildados.
@@ -309,6 +427,13 @@ function Invoke-GamingMode {
         $n += Stop-ServicesByName @($svcTerceros | ForEach-Object { $_.Name })
     }
     if ($n -eq 0) { Write-Log 'No había servicios pausables corriendo.' 'info' }
+
+    # 5) Red: limpiar caché DNS y recordar los tweaks de latencia
+    ipconfig /flushdns | Out-Null
+    Write-Log 'Caché DNS limpiada.' 'ok'
+    if (-not (Test-Path $NetBackupPath)) {
+        Write-Log "Tip: tocá 'Optimizar red' para aplicar los tweaks de latencia (se hace una sola vez)." 'info'
+    }
 
     Start-Sleep -Milliseconds 1500
     $ramDespues = Get-FreeRamMB
@@ -511,6 +636,38 @@ $btnSvcStart.FlatStyle = 'Flat'
 $btnSvcStart.Add_Click({ Restore-Services })
 $form.Controls.Add($btnSvcStart)
 
+# ----- Botones de red -----
+$btnNetOpt = New-Object System.Windows.Forms.Button
+$btnNetOpt.Text      = 'Optimizar red'
+$btnNetOpt.Location  = New-Object System.Drawing.Point(620, 465)
+$btnNetOpt.Size      = New-Object System.Drawing.Size(120, 34)
+$btnNetOpt.BackColor = $colAccent
+$btnNetOpt.ForeColor = [System.Drawing.Color]::White
+$btnNetOpt.FlatStyle = 'Flat'
+$btnNetOpt.FlatAppearance.BorderSize = 0
+$btnNetOpt.Add_Click({ Optimize-Network })
+$form.Controls.Add($btnNetOpt)
+
+$btnNetUndo = New-Object System.Windows.Forms.Button
+$btnNetUndo.Text      = 'Revertir red'
+$btnNetUndo.Location  = New-Object System.Drawing.Point(750, 465)
+$btnNetUndo.Size      = New-Object System.Drawing.Size(102, 34)
+$btnNetUndo.BackColor = $colPanel
+$btnNetUndo.ForeColor = $colText
+$btnNetUndo.FlatStyle = 'Flat'
+$btnNetUndo.Add_Click({ Restore-Network })
+$form.Controls.Add($btnNetUndo)
+
+$btnPing = New-Object System.Windows.Forms.Button
+$btnPing.Text      = 'Test ping'
+$btnPing.Location  = New-Object System.Drawing.Point(862, 465)
+$btnPing.Size      = New-Object System.Drawing.Size(108, 34)
+$btnPing.BackColor = $colPanel
+$btnPing.ForeColor = $colText
+$btnPing.FlatStyle = 'Flat'
+$btnPing.Add_Click({ Test-PingLatency })
+$form.Controls.Add($btnPing)
+
 # ----- Registro -----
 $lblLog = New-Object System.Windows.Forms.Label
 $lblLog.Text      = 'Registro'
@@ -546,7 +703,7 @@ function Write-Log([string]$msg, [string]$kind = 'info') {
 
 # --- Arranque --------------------------------------------------
 $form.Add_Shown({
-    Write-Log 'Booster v2 listo. Tocá MODO GAMING o revisá las listas.' 'title'
+    Write-Log 'Booster v3 listo. Tocá MODO GAMING, y probá Test ping antes y después de Optimizar red.' 'title'
     Refresh-ServiceList
     Refresh-ProcessList
 })
