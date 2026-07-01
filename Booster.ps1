@@ -1,11 +1,14 @@
 ﻿# ============================================================
-#  BOOSTER v3 - Optimizador gaming para despues del trabajo
+#  BOOSTER v4 - Optimizador gaming para despues del trabajo
 #  - Listas con comodines (Adobe* cierra todo lo de Adobe)
 #  - Barrido de procesos de fondo sin ventana
 #  - Pausa servicios de Windows Y de terceros (updaters, etc.)
 #  - Protege anticheats, drivers de GPU/audio/perifericos
 #  - Modulo de red: menos latencia (Nagle, throttling, DNS)
-#    con backup de los valores originales y boton de revertir
+#  - Tweaks persistentes con backup: GameDVR off y ahorro de
+#    energia de NIC/USB off; un boton para revertir todo
+#  - Plan de energia Alto rendimiento en modo gaming
+#  - Timer del sistema a 0.5 ms mientras Booster este abierto
 # ============================================================
 #Requires -Version 5.1
 
@@ -20,11 +23,24 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# API nativa para el timer de alta precisión (estilo TimerResolution/ISLC)
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class BoosterTimer {
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryTimerResolution(out uint min, out uint max, out uint current);
+    [DllImport("ntdll.dll")]
+    public static extern int NtSetTimerResolution(uint desired, bool set, out uint current);
+}
+"@
+
 # --- Configuración -------------------------------------------
 $script:Dir        = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:ConfigPath = Join-Path $Dir 'config.json'
 $script:StatePath     = Join-Path $Dir '.booster_state.json'
 $script:NetBackupPath = Join-Path $Dir '.booster_net_backup.json'
+$script:TweaksPath    = Join-Path $Dir '.booster_tweaks.json'
 
 # Todas las listas de procesos/servicios aceptan comodines: 'Adobe*'
 $defaultConfig = [ordered]@{
@@ -165,13 +181,40 @@ function Close-ProcessByName([string]$name) {
     Write-Log "Cerrado: $name (~$ram MB)" 'ok'
 }
 
-function Add-StoppedToState([string[]]$names) {
-    $previos = @()
-    if (Test-Path $StatePath) {
-        try { $previos = @(Get-Content $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json) } catch {}
+function Get-State {
+    # Estado de lo que Booster pausó/cambió en esta sesión (para restaurar).
+    # Soporta el formato viejo (lista simple de servicios).
+    $vacio = [pscustomobject]@{ servicios = @(); planEnergiaPrevio = $null }
+    if (-not (Test-Path $StatePath)) { return $vacio }
+    try {
+        $raw = Get-Content $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($raw -is [string] -or $raw -is [array]) {
+            return [pscustomobject]@{ servicios = @($raw); planEnergiaPrevio = $null }
+        }
+        if ($raw.PSObject.Properties.Name -notcontains 'servicios') {
+            $raw | Add-Member -NotePropertyName servicios -NotePropertyValue @()
+        } else {
+            $raw.servicios = @($raw.servicios | Where-Object { $_ })
+        }
+        if ($raw.PSObject.Properties.Name -notcontains 'planEnergiaPrevio') {
+            $raw | Add-Member -NotePropertyName planEnergiaPrevio -NotePropertyValue $null
+        }
+        return $raw
+    } catch { return $vacio }
+}
+
+function Save-State($state) {
+    if (@($state.servicios).Count -eq 0 -and -not $state.planEnergiaPrevio) {
+        if (Test-Path $StatePath) { Remove-Item $StatePath -Force }
+        return
     }
-    $union = @($previos + $names | Select-Object -Unique)
-    ConvertTo-Json -InputObject $union | Set-Content $StatePath -Encoding UTF8
+    ConvertTo-Json -InputObject $state -Depth 4 | Set-Content $StatePath -Encoding UTF8
+}
+
+function Add-StoppedToState([string[]]$names) {
+    $state = Get-State
+    $state.servicios = @(@($state.servicios) + $names | Select-Object -Unique)
+    Save-State $state
 }
 
 function Stop-ServicesByName([string[]]$names) {
@@ -193,10 +236,8 @@ function Stop-ServicesByName([string[]]$names) {
 }
 
 function Restore-Services {
-    $lista = @($Config.serviciosPausables)
-    if (Test-Path $StatePath) {
-        try { $lista += @(Get-Content $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json) } catch {}
-    }
+    $state = Get-State
+    $lista = @($Config.serviciosPausables) + @($state.servicios)
     foreach ($svcName in ($lista | Select-Object -Unique)) {
         $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
         if ($svc -and $svc.Status -ne 'Running') {
@@ -207,6 +248,10 @@ function Restore-Services {
                 Write-Log "No se pudo iniciar el servicio $svcName" 'err'
             }
         }
+    }
+    if ($state.planEnergiaPrevio) {
+        powercfg /setactive $state.planEnergiaPrevio 2>&1 | Out-Null
+        Write-Log 'Plan de energía original restaurado.' 'ok'
     }
     if (Test-Path $StatePath) { Remove-Item $StatePath -Force }
     Refresh-ServiceList
@@ -304,6 +349,167 @@ function Restore-Network {
     }
     Remove-Item $NetBackupPath -Force
     Write-Log 'Configuración de red revertida a los valores originales (se completa al reiniciar).' 'ok'
+}
+
+# --- Tweaks persistentes: GameDVR y ahorro de energía ----------
+$script:GameDvrKeys = @(
+    @{ PS = 'HKCU:\System\GameConfigStore';                            Name = 'GameDVR_Enabled' },
+    @{ PS = 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR'; Name = 'AppCaptureEnabled' },
+    @{ PS = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR';       Name = 'AllowGameDVR' }
+)
+
+function Disable-DevicePowerSaving {
+    # Desactiva "permitir que el equipo apague este dispositivo" en la
+    # placa de red activa y en los dispositivos USB (evita picos de
+    # latencia y bajones de polling del mouse). Devuelve lo que tocó.
+    $apagados = @()
+    $nicIds = @()
+    try {
+        $nicIds = @((Get-NetAdapter -Physical -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }).PnpDeviceID)
+    } catch {}
+    foreach ($d in @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction SilentlyContinue)) {
+        if (-not $d.Enable) { continue }
+        $esNic = $false
+        foreach ($id in $nicIds) {
+            if ($id -and $d.InstanceName -like "$id*") { $esNic = $true; break }
+        }
+        if (-not ($esNic -or $d.InstanceName -like 'USB\*')) { continue }
+        try {
+            Set-CimInstance -InputObject $d -Property @{ Enable = $false } -ErrorAction Stop
+            $apagados += $d.InstanceName
+        } catch {}
+    }
+    return ,$apagados
+}
+
+function Optimize-System {
+    # Aplica todos los tweaks persistentes. Cada bloque guarda backup
+    # y se saltea si Booster ya lo aplicó antes.
+    Optimize-Network
+
+    $tweaks = $null
+    if (Test-Path $TweaksPath) {
+        try { $tweaks = Get-Content $TweaksPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+    }
+    if (-not $tweaks) { $tweaks = [pscustomobject]@{} }
+
+    # GameDVR / Game Bar: Windows graba gameplay de fondo por defecto
+    if ($tweaks.PSObject.Properties.Name -notcontains 'gameDvr') {
+        $bk = [ordered]@{}
+        foreach ($k in $GameDvrKeys) {
+            $bk[$k.Name] = Get-RegValueOrNull $k.PS $k.Name
+            if (-not (Test-Path $k.PS)) { New-Item -Path $k.PS -Force | Out-Null }
+            Set-ItemProperty -Path $k.PS -Name $k.Name -Value 0 -Type DWord
+        }
+        $tweaks | Add-Member -NotePropertyName gameDvr -NotePropertyValue $bk
+        Write-Log 'GameDVR / Game Bar desactivados: la GPU deja de grabar gameplay de fondo.' 'ok'
+    } else {
+        Write-Log 'GameDVR ya estaba desactivado por Booster.' 'info'
+    }
+
+    # Ahorro de energía de NIC y USB
+    if ($tweaks.PSObject.Properties.Name -notcontains 'ahorroDispositivos') {
+        $apagados = Disable-DevicePowerSaving
+        $tweaks | Add-Member -NotePropertyName ahorroDispositivos -NotePropertyValue $apagados
+        Write-Log ("Ahorro de energía desactivado en {0} dispositivo(s) de red/USB." -f @($apagados).Count) 'ok'
+    } else {
+        Write-Log 'El ahorro de energía de red/USB ya estaba desactivado por Booster.' 'info'
+    }
+
+    ConvertTo-Json -InputObject $tweaks -Depth 6 | Set-Content $TweaksPath -Encoding UTF8
+}
+
+function Restore-Tweaks {
+    Restore-Network
+
+    $tweaks = $null
+    if (Test-Path $TweaksPath) {
+        try { $tweaks = Get-Content $TweaksPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+    }
+    if (-not $tweaks) { return }
+
+    if ($tweaks.PSObject.Properties.Name -contains 'gameDvr') {
+        foreach ($k in $GameDvrKeys) {
+            $val = $tweaks.gameDvr.($k.Name)
+            if ($null -eq $val) {
+                Remove-ItemProperty -Path $k.PS -Name $k.Name -ErrorAction SilentlyContinue
+            } else {
+                Set-ItemProperty -Path $k.PS -Name $k.Name -Value ([int]$val) -Type DWord
+            }
+        }
+        Write-Log 'GameDVR restaurado a su configuración original.' 'ok'
+    }
+
+    if ($tweaks.PSObject.Properties.Name -contains 'ahorroDispositivos') {
+        $instancias = @($tweaks.ahorroDispositivos)
+        $n = 0
+        foreach ($d in @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction SilentlyContinue)) {
+            if ($instancias -contains $d.InstanceName) {
+                try {
+                    Set-CimInstance -InputObject $d -Property @{ Enable = $true } -ErrorAction Stop
+                    $n++
+                } catch {}
+            }
+        }
+        Write-Log "Ahorro de energía reactivado en $n dispositivo(s)." 'ok'
+    }
+    Remove-Item $TweaksPath -Force
+}
+
+# --- Plan de energía y timer de alta precisión ------------------
+$script:PlanAltoRendimiento = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
+
+function Get-ActivePowerPlan {
+    $out = powercfg /getactivescheme 2>&1 | Out-String
+    if ($out -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') { return $Matches[1] }
+    return $null
+}
+
+function Enable-HighPerformance {
+    $actual = Get-ActivePowerPlan
+    if (-not $actual) { return }
+    # Solo se cambia si el plan actual es uno de los stock que frenan el CPU
+    # (Equilibrado o Economizador). Un plan de rendimiento ya activo
+    # (Alto, Ultimate, o uno custom tipo ExitLag) no se toca.
+    $planesLentos = @('381b4222-f694-41f0-9685-ff5bb260df2e', 'a1841308-3541-4fab-bc81-f71556f20b4a')
+    if ($planesLentos -notcontains $actual.ToLower()) {
+        Write-Log 'Tu plan de energía actual ya es de rendimiento, no se toca.' 'info'
+        return
+    }
+    powercfg /setactive $PlanAltoRendimiento 2>&1 | Out-Null
+    $nuevo = Get-ActivePowerPlan
+    if ($nuevo -ine $PlanAltoRendimiento) {
+        # En algunas PCs el plan viene oculto: se duplica y se activa la copia
+        $dup = powercfg /duplicatescheme $PlanAltoRendimiento 2>&1 | Out-String
+        if ($dup -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+            powercfg /setactive $Matches[1] 2>&1 | Out-Null
+            $nuevo = Get-ActivePowerPlan
+        }
+    }
+    if ($nuevo -ine $actual) {
+        $state = Get-State
+        $state.planEnergiaPrevio = $actual
+        Save-State $state
+        Write-Log "Plan de energía: Alto rendimiento activado (se vuelve con 'Restaurar todo')." 'ok'
+    } else {
+        Write-Log 'No se pudo activar el plan Alto rendimiento.' 'err'
+    }
+}
+
+function Set-TimerResolution([bool]$activar) {
+    # El timer por defecto de Windows es de 15.6 ms; subirlo a 0.5 ms
+    # mejora el frame pacing. Dura mientras el proceso viva: al cerrar
+    # Booster, Windows lo libera solo.
+    $min = [uint32]0; $max = [uint32]0; $cur = [uint32]0
+    [void][BoosterTimer]::NtQueryTimerResolution([ref]$min, [ref]$max, [ref]$cur)
+    $out = [uint32]0
+    if ($activar) {
+        [void][BoosterTimer]::NtSetTimerResolution($max, $true, [ref]$out)
+        Write-Log ("Timer del sistema: {0:N2} ms -> {1:N2} ms (dura mientras Booster esté abierto)." -f ($cur / 10000), ($out / 10000)) 'ok'
+    } else {
+        [void][BoosterTimer]::NtSetTimerResolution($max, $false, [ref]$out)
+        Write-Log 'Timer del sistema liberado.' 'info'
+    }
 }
 
 function Test-PingLatency {
@@ -428,12 +634,16 @@ function Invoke-GamingMode {
     }
     if ($n -eq 0) { Write-Log 'No había servicios pausables corriendo.' 'info' }
 
-    # 5) Red: limpiar caché DNS y recordar los tweaks de latencia
+    # 5) Red: limpiar caché DNS y recordar los tweaks persistentes
     ipconfig /flushdns | Out-Null
     Write-Log 'Caché DNS limpiada.' 'ok'
-    if (-not (Test-Path $NetBackupPath)) {
-        Write-Log "Tip: tocá 'Optimizar red' para aplicar los tweaks de latencia (se hace una sola vez)." 'info'
+    if (-not (Test-Path $NetBackupPath) -or -not (Test-Path $TweaksPath)) {
+        Write-Log "Tip: tocá 'Optimizar PC' para los tweaks persistentes (red, GameDVR, ahorro de energía). Se hace una sola vez." 'info'
     }
+
+    # 6) Plan de energía Alto rendimiento y timer de 0.5 ms
+    Enable-HighPerformance
+    if (-not $chkTimer.Checked) { $chkTimer.Checked = $true }
 
     Start-Sleep -Milliseconds 1500
     $ramDespues = Get-FreeRamMB
@@ -480,6 +690,14 @@ $btnGaming.FlatStyle = 'Flat'
 $btnGaming.FlatAppearance.BorderSize = 0
 $btnGaming.Add_Click({ Invoke-GamingMode })
 $form.Controls.Add($btnGaming)
+
+$chkTimer = New-Object System.Windows.Forms.CheckBox
+$chkTimer.Text      = 'Timer 0,5 ms'
+$chkTimer.Location  = New-Object System.Drawing.Point(620, 33)
+$chkTimer.Size      = New-Object System.Drawing.Size(112, 24)
+$chkTimer.ForeColor = $colText
+$chkTimer.Add_CheckedChanged({ Set-TimerResolution $chkTimer.Checked })
+$form.Controls.Add($chkTimer)
 
 # ----- Panel de procesos -----
 $lblProc = New-Object System.Windows.Forms.Label
@@ -594,17 +812,13 @@ function Refresh-ServiceList {
         $agregados[$svc.Name] = $true
     }
     # Servicios de terceros que Booster pausó (para que se vean y se puedan restaurar)
-    if (Test-Path $StatePath) {
-        try {
-            foreach ($svcName in @(Get-Content $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json)) {
-                if ($agregados.ContainsKey($svcName)) { continue }
-                $item = New-Object System.Windows.Forms.ListViewItem($svcName)
-                [void]$item.SubItems.Add('Pausado')
-                [void]$item.SubItems.Add('Terceros')
-                $item.ForeColor = $colDim
-                [void]$lvSvc.Items.Add($item)
-            }
-        } catch {}
+    foreach ($svcName in @((Get-State).servicios)) {
+        if (-not $svcName -or $agregados.ContainsKey($svcName)) { continue }
+        $item = New-Object System.Windows.Forms.ListViewItem($svcName)
+        [void]$item.SubItems.Add('Pausado')
+        [void]$item.SubItems.Add('Terceros')
+        $item.ForeColor = $colDim
+        [void]$lvSvc.Items.Add($item)
     }
 }
 
@@ -638,30 +852,30 @@ $form.Controls.Add($btnSvcStart)
 
 # ----- Botones de red -----
 $btnNetOpt = New-Object System.Windows.Forms.Button
-$btnNetOpt.Text      = 'Optimizar red'
+$btnNetOpt.Text      = 'Optimizar PC'
 $btnNetOpt.Location  = New-Object System.Drawing.Point(620, 465)
-$btnNetOpt.Size      = New-Object System.Drawing.Size(120, 34)
+$btnNetOpt.Size      = New-Object System.Drawing.Size(115, 34)
 $btnNetOpt.BackColor = $colAccent
 $btnNetOpt.ForeColor = [System.Drawing.Color]::White
 $btnNetOpt.FlatStyle = 'Flat'
 $btnNetOpt.FlatAppearance.BorderSize = 0
-$btnNetOpt.Add_Click({ Optimize-Network })
+$btnNetOpt.Add_Click({ Optimize-System })
 $form.Controls.Add($btnNetOpt)
 
 $btnNetUndo = New-Object System.Windows.Forms.Button
-$btnNetUndo.Text      = 'Revertir red'
-$btnNetUndo.Location  = New-Object System.Drawing.Point(750, 465)
-$btnNetUndo.Size      = New-Object System.Drawing.Size(102, 34)
+$btnNetUndo.Text      = 'Revertir tweaks'
+$btnNetUndo.Location  = New-Object System.Drawing.Point(745, 465)
+$btnNetUndo.Size      = New-Object System.Drawing.Size(115, 34)
 $btnNetUndo.BackColor = $colPanel
 $btnNetUndo.ForeColor = $colText
 $btnNetUndo.FlatStyle = 'Flat'
-$btnNetUndo.Add_Click({ Restore-Network })
+$btnNetUndo.Add_Click({ Restore-Tweaks })
 $form.Controls.Add($btnNetUndo)
 
 $btnPing = New-Object System.Windows.Forms.Button
 $btnPing.Text      = 'Test ping'
-$btnPing.Location  = New-Object System.Drawing.Point(862, 465)
-$btnPing.Size      = New-Object System.Drawing.Size(108, 34)
+$btnPing.Location  = New-Object System.Drawing.Point(870, 465)
+$btnPing.Size      = New-Object System.Drawing.Size(100, 34)
 $btnPing.BackColor = $colPanel
 $btnPing.ForeColor = $colText
 $btnPing.FlatStyle = 'Flat'
@@ -703,7 +917,7 @@ function Write-Log([string]$msg, [string]$kind = 'info') {
 
 # --- Arranque --------------------------------------------------
 $form.Add_Shown({
-    Write-Log 'Booster v3 listo. Tocá MODO GAMING, y probá Test ping antes y después de Optimizar red.' 'title'
+    Write-Log 'Booster v4 listo. MODO GAMING activa energía y timer; Optimizar PC aplica los tweaks persistentes.' 'title'
     Refresh-ServiceList
     Refresh-ProcessList
 })

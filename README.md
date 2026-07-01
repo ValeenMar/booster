@@ -34,16 +34,26 @@ No hace falta instalar PowerShell ni nada más: Windows ya trae todo lo que Boos
 4. **Pausa servicios de terceros** que matcheen `serviciosTercerosAuto`: updaters de Adobe/Google/Edge/LG, Bonjour, TeamViewer, etc.
 
 5. **Corta las descargas en segundo plano que meten lag**: pausa Windows Update, Delivery Optimization (que sube actualizaciones a otras PCs usando TU internet) y BITS, y limpia la caché DNS.
+6. **Activa el plan de energía Alto rendimiento** (en Equilibrado, Windows estaciona núcleos del CPU y eso genera micro-stutters) y **sube el timer del sistema a 0,5 ms** para mejor frame pacing.
 
-Al final te dice cuánta RAM libre ganaste. Todo lo pausado se restaura con el botón **Restaurar todo** o solo al reiniciar la PC.
+Al final te dice cuánta RAM libre ganaste. Todo lo pausado se restaura con el botón **Restaurar todo** (incluido el plan de energía) o solo al reiniciar la PC. El timer se libera al cerrar Booster.
 
-## Módulo de red: bajar el ping 🌐
+## Timer de 0,5 ms ⏱️
+
+El timer por defecto de Windows corre a 15,6 ms; con el checkbox **Timer 0,5 ms** (arriba a la derecha) Booster lo fuerza a la máxima precisión, igual que herramientas como TimerResolution o ISLC. Mejora el frame pacing y la consistencia de frames en varios juegos. Es riesgo cero: dura solo mientras Booster esté abierto — al cerrarlo, Windows lo devuelve al valor normal automáticamente. El modo gaming lo activa solo (dejá Booster abierto mientras jugás).
+
+## Tweaks persistentes: Optimizar PC 🔧
 
 Tres botones abajo del panel de servicios:
 
-- **Optimizar red** (se aplica una sola vez): desactiva el *algoritmo de Nagle* y el *delayed ACK* (Windows agrupa paquetes chicos antes de mandarlos: bueno para descargas, malo para el ping en juegos) y desactiva el *throttling de red* que Windows aplica cuando reproducís audio/video. Termina de aplicarse al reiniciar la PC.
-- **Revertir red**: deshace todo. Antes de tocar nada, Booster guarda los valores originales en `.booster_net_backup.json` y los restaura exactos.
+- **Optimizar PC** (se aplica una sola vez, con backup de cada valor original):
+  - **Red**: desactiva el *algoritmo de Nagle* y el *delayed ACK* (Windows agrupa paquetes chicos antes de mandarlos: bueno para descargas, malo para el ping) y el *throttling de red* que Windows aplica cuando reproducís audio/video. Si un valor ya está igual o mejor (por otro tweak previo), no lo toca.
+  - **GameDVR / Game Bar**: Windows graba gameplay en segundo plano *por defecto* para el "grabar últimos 30 segundos" — eso es GPU trabajando en algo que no es tu juego. Se desactiva.
+  - **Ahorro de energía de red y USB**: Windows apaga la placa de red y los puertos USB para ahorrar energía, lo que mete picos de latencia y afecta el polling del mouse. Se desactiva en la NIC activa y los dispositivos USB.
+- **Revertir tweaks**: deshace TODO usando los backups (`.booster_net_backup.json` y `.booster_tweaks.json`) y restaura los valores exactos que tenías.
 - **Test ping**: mide latencia promedio, mínima, máxima y jitter contra 1.1.1.1 y 8.8.8.8. Ideal para comparar antes y después.
+
+Los cambios de registro terminan de aplicarse al reiniciar la PC.
 
 **Qué esperar, siendo honestos**: estos tweaks eliminan las fuentes *locales* de latencia (descargas de fondo, buffering de paquetes, throttling). Suelen bajar algunos ms y sobre todo estabilizar el jitter y los picos de lag. Lo que NO pueden hacer es acortar la distancia física a los servidores del juego ni arreglar una conexión mala del proveedor — para eso no hay software que valga.
 
@@ -62,7 +72,7 @@ Booster **nunca** toca, aunque los agregues a las listas por error:
 - **Drivers y software de periféricos**: NVIDIA, AMD, Realtek, Logitech G HUB, Razer, Corsair iCUE, SteelSeries — los necesitás mientras jugás.
 - **ExitLag** y similares que usás para jugar.
 
-Los servicios solo se **pausan**, nunca se deshabilitan: al reiniciar Windows vuelven solos. El único cambio persistente es el de **Optimizar red** (3 valores de registro), que guarda backup y se deshace entero con **Revertir red**.
+Los servicios solo se **pausan**, nunca se deshabilitan: al reiniciar Windows vuelven solos. Los únicos cambios persistentes son los de **Optimizar PC** (valores de registro y ahorro de energía de dispositivos, todos documentados arriba), que guardan backup de los valores originales y se deshacen enteros con **Revertir tweaks**.
 
 ## Personalizarlo
 

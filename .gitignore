@@ -2,3 +2,5 @@
 .booster_state.json
 # Backup de los valores de registro previos a Optimizar red
 .booster_net_backup.json
+# Backup de los tweaks persistentes (GameDVR, ahorro de energia)
+.booster_tweaks.json
