@@ -1,5 +1,5 @@
 ﻿# ============================================================
-#  BOOSTER v6 - Optimizador gaming para despues del trabajo
+#  BOOSTER v7 - Optimizador gaming para despues del trabajo
 #  - Listas con comodines (Adobe* cierra todo lo de Adobe)
 #  - Barrido de procesos de fondo sin ventana
 #  - Pausa servicios de Windows Y de terceros (updaters, etc.)
@@ -918,7 +918,7 @@ function Invoke-GamingMode([switch]$Silencioso) {
     $script:BoostEnCurso = $false
 }
 
-# --- GUI v6: dashboard con gráfico de RAM en vivo ---------------
+# --- GUI v7: 3 páginas (Limpieza / Recursos / Pro) ---------------
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = 'Booster - Optimizador gaming'
 $form.Size            = New-Object System.Drawing.Size(1180, 850)
@@ -940,7 +940,8 @@ function Set-Rounded($ctl, [int]$r) {
     $ctl.Region = New-Object System.Drawing.Region($gp)
 }
 
-function New-Btn([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $bg, $fg) {
+function New-Btn([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $bg, $fg, $parent) {
+    if (-not $parent) { $parent = $form }
     $b = New-Object System.Windows.Forms.Button
     $b.Text      = $text
     $b.Location  = New-Object System.Drawing.Point($x, $y)
@@ -952,12 +953,12 @@ function New-Btn([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $bg, $fg) {
     $b.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5)
     $b.Cursor    = 'Hand'
     Set-Rounded $b 8
-    $form.Controls.Add($b)
+    $parent.Controls.Add($b)
     return $b
 }
 
 function New-Toggle([string]$text, [int]$x, [int]$y, [int]$w) {
-    # Checkbox con pinta de pill/toggle: gris apagado, mauve encendido
+    # Checkbox con pinta de pill: gris apagado, mauve encendido
     $t = New-Object System.Windows.Forms.CheckBox
     $t.Appearance = 'Button'
     $t.Text       = $text
@@ -974,6 +975,14 @@ function New-Toggle([string]$text, [int]$x, [int]$y, [int]$w) {
     Set-Rounded $t 18
     $form.Controls.Add($t)
     return $t
+}
+
+function Set-AllChecks($lv) {
+    # Autoseleccionador: tilda todo; si ya estaba todo tildado, destilda todo
+    if ($lv.Items.Count -eq 0) { return }
+    $faltan = @($lv.Items | Where-Object { -not $_.Checked }).Count
+    $nuevo = ($faltan -gt 0)
+    foreach ($item in $lv.Items) { $item.Checked = $nuevo }
 }
 
 # ----- Header -----
@@ -1004,182 +1013,64 @@ $chkAuto.Add_CheckedChanged({
     }
 })
 
-$btnGaming = New-Btn 'MODO GAMING' 966 14 174 48 $colAccent $colDark
+$btnGaming = New-Btn 'MODO GAMING' 966 14 174 48 $colAccent $colDark $form
 $btnGaming.Font = New-Object System.Drawing.Font('Segoe UI', 11.5, [System.Drawing.FontStyle]::Bold)
 $btnGaming.Add_Click({ Invoke-GamingMode })
 
-# ----- Gráfico de RAM en vivo -----
-$script:RamHist          = New-Object System.Collections.ArrayList
-$script:PurgeMarks       = New-Object System.Collections.ArrayList
-$script:TickNum          = 0
-$script:HistCap          = 180      # 3 minutos de historia a 1 muestra/seg
-$script:PurgadoSesionMB  = 0
-$script:TotalRamMB       = ([BoosterRam]::Query())[0]
-$script:JuegoDetectado   = $false
-$script:BoostEnCurso     = $false
+# ----- Navegación de páginas -----
+$btnNavLimpieza = New-Btn 'Limpieza' 24 84 130 34 $colSurface $colText $form
+$btnNavRecursos = New-Btn 'Recursos' 162 84 130 34 $colSurface $colText $form
+$btnNavPro      = New-Btn 'Pro'      300 84 130 34 $colSurface $colText $form
 
-# Recursos GDI creados una sola vez (crearlos en cada Paint filtra handles)
-$script:cFontCap  = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
-$script:cFontTiny = New-Object System.Drawing.Font('Segoe UI', 8)
-$script:cFontBig  = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
-$script:cBrDim    = New-Object System.Drawing.SolidBrush($colDim)
-$script:cBrAccent = New-Object System.Drawing.SolidBrush($colAccent)
-$script:cBrGreen  = New-Object System.Drawing.SolidBrush($colGreen)
-$script:cBrHalo   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(70, $colAccent))
-$script:cPenGrid  = New-Object System.Drawing.Pen($colSurface, 1)
-$script:cPenLine  = New-Object System.Drawing.Pen($colAccent, 2.2)
-$script:cPenLine.LineJoin = 'Round'
-$script:cPenMark  = New-Object System.Drawing.Pen($colGreen, 1.4)
-$script:cPenMark.DashStyle = 'Dash'
-
-$chartPanel = New-Object System.Windows.Forms.Panel
-$chartPanel.Location  = New-Object System.Drawing.Point(24, 78)
-$chartPanel.Size      = New-Object System.Drawing.Size(1116, 190)
-$chartPanel.BackColor = $colPanel
-Set-Rounded $chartPanel 12
-# DoubleBuffered es protected en Panel: se activa por reflexión para que no parpadee
-[System.Windows.Forms.Panel].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($chartPanel, $true, $null)
-$form.Controls.Add($chartPanel)
-
-$chartPanel.Add_Paint({
-    param($sender, $e)
-    $g = $e.Graphics
-    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $W = $sender.ClientSize.Width; $H = $sender.ClientSize.Height
-    $padL = 18; $padR = 84; $padT = 42; $padB = 16
-    $plotW = $W - $padL - $padR; $plotH = $H - $padT - $padB
-
-    # Título + leyenda de purgas
-    $g.DrawString('RAM EN VIVO', $cFontCap, $cBrDim, 18, 13)
-    $g.DrawLine($cPenMark, 118, 21, 140, 21)
-    $g.DrawString('purga', $cFontTiny, $cBrGreen, 144, 14)
-
-    $hist = @($script:RamHist)
-    if ($hist.Count -ge 1) {
-        # Valor actual grande, arriba a la derecha
-        $ultimo = $hist[$hist.Count - 1]
-        $txt = ('{0:N1} GB' -f ($ultimo.UsedMB / 1024))
-        $szB = $g.MeasureString($txt, $cFontBig)
-        $g.DrawString($txt, $cFontBig, $cBrAccent, $W - 18 - $szB.Width, 6)
-        $sub = ('en uso de {0:N0} GB' -f ($script:TotalRamMB / 1024))
-        $szS = $g.MeasureString($sub, $cFontTiny)
-        $g.DrawString($sub, $cFontTiny, $cBrDim, $W - 18 - $szS.Width, 6 + $szB.Height - 5)
-    }
-    if ($hist.Count -lt 2) {
-        $g.DrawString('Recolectando datos...', $cFontCap, $cBrDim, $padL, $padT + $plotH / 2)
-        return
-    }
-
-    # Escala Y dinámica: zoom al rango real para que las purgas se VEAN
-    $vals = $hist | ForEach-Object { $_.UsedMB }
-    $minV = ($vals | Measure-Object -Minimum).Minimum
-    $maxV = ($vals | Measure-Object -Maximum).Maximum
-    $rango = [Math]::Max($maxV - $minV, $script:TotalRamMB * 0.04)
-    $yMin = [Math]::Max(0, $minV - $rango * 0.25)
-    $yMax = $maxV + $rango * 0.25
-
-    # Grilla horizontal con etiquetas en GB
-    for ($i = 0; $i -le 3; $i++) {
-        $y = $padT + $plotH * $i / 3
-        $g.DrawLine($cPenGrid, $padL, $y, $padL + $plotW, $y)
-        $v = $yMax - ($yMax - $yMin) * $i / 3
-        $g.DrawString(('{0:N1} GB' -f ($v / 1024)), $cFontTiny, $cBrDim, $padL + $plotW + 8, $y - 8)
-    }
-
-    # Puntos de la curva (ventana fija anclada a la derecha, avanza como ticker)
-    $lastTick = $hist[$hist.Count - 1].Tick
-    $firstTick = $hist[0].Tick
-    $step = $plotW / [Math]::Max(1, ($script:HistCap - 1))
-    $pts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
-    foreach ($m in $hist) {
-        $x = $padL + $plotW - ($lastTick - $m.Tick) * $step
-        $frac = ($m.UsedMB - $yMin) / ($yMax - $yMin)
-        $y = $padT + $plotH * (1 - $frac)
-        $pts.Add((New-Object System.Drawing.PointF($x, $y)))
-    }
-
-    # Área bajo la curva con gradiente mauve -> transparente
-    $area = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $area.AddLines($pts.ToArray())
-    $area.AddLine($pts[$pts.Count - 1].X, $padT + $plotH, $pts[0].X, $padT + $plotH)
-    $area.CloseFigure()
-    $rect = New-Object System.Drawing.RectangleF($padL, $padT, $plotW, $plotH + 1)
-    $grad = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, [System.Drawing.Color]::FromArgb(105, $colAccent), [System.Drawing.Color]::FromArgb(0, $colAccent), 90.0)
-    $g.FillPath($grad, $area)
-    $grad.Dispose(); $area.Dispose()
-
-    # Línea principal + punto vivo con halo
-    $g.DrawLines($cPenLine, $pts.ToArray())
-    $pu = $pts[$pts.Count - 1]
-    $g.FillEllipse($cBrHalo, $pu.X - 7, $pu.Y - 7, 14, 14)
-    $g.FillEllipse($cBrAccent, $pu.X - 3.5, $pu.Y - 3.5, 7, 7)
-
-    # Marcas de purga: línea vertical verde + GB liberados
-    foreach ($mk in @($script:PurgeMarks)) {
-        if ($mk.Tick -lt $firstTick) { continue }
-        $x = $padL + $plotW - ($lastTick - $mk.Tick) * $step
-        $g.DrawLine($cPenMark, $x, $padT, $x, $padT + $plotH)
-        $lbl = 'PURGA ' + $mk.Texto
-        $sz = $g.MeasureString($lbl, $cFontTiny)
-        $lx = [Math]::Max($padL, [Math]::Min($x - $sz.Width / 2, $padL + $plotW - $sz.Width))
-        $g.DrawString($lbl, $cFontTiny, $cBrGreen, $lx, $padT - 16)
-    }
-})
-
-# ----- Tarjetas de métricas -----
-function New-Card([string]$caption, [int]$x, $valColor) {
-    $p = New-Object System.Windows.Forms.Panel
-    $p.Location  = New-Object System.Drawing.Point($x, 280)
-    $p.Size      = New-Object System.Drawing.Size(270, 66)
-    $p.BackColor = $colPanel
-    Set-Rounded $p 10
-    $cap = New-Object System.Windows.Forms.Label
-    $cap.Text      = $caption
-    $cap.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.25)
-    $cap.ForeColor = $colDim
-    $cap.Location  = New-Object System.Drawing.Point(14, 9)
-    $cap.AutoSize  = $true
-    $p.Controls.Add($cap)
-    $val = New-Object System.Windows.Forms.Label
-    $val.Text      = '—'
-    $val.Font      = New-Object System.Drawing.Font('Segoe UI', 15, [System.Drawing.FontStyle]::Bold)
-    $val.ForeColor = $valColor
-    $val.Location  = New-Object System.Drawing.Point(12, 27)
-    $val.AutoSize  = $true
-    $p.Controls.Add($val)
-    $form.Controls.Add($p)
-    return $val
+$pageLimpieza = New-Object System.Windows.Forms.Panel
+$pageRecursos = New-Object System.Windows.Forms.Panel
+$pagePro      = New-Object System.Windows.Forms.Panel
+foreach ($pg in @($pageLimpieza, $pageRecursos, $pagePro)) {
+    $pg.Location  = New-Object System.Drawing.Point(24, 130)
+    $pg.Size      = New-Object System.Drawing.Size(1116, 540)
+    $pg.BackColor = $colBg
+    $pg.Visible   = $false
+    $form.Controls.Add($pg)
 }
 
-$lblCardUsada = New-Card 'RAM EN USO'            24  $colAccent
-$lblCardLibre = New-Card 'RAM LIBRE'             306 $colGreen
-$lblCardCarga = New-Card 'CARGA DE MEMORIA'      588 $colText
-$lblCardPurga = New-Card 'PURGADO ESTA SESIÓN'   870 $colTeal
+function Show-Page([string]$name) {
+    $pageLimpieza.Visible = ($name -eq 'limpieza')
+    $pageRecursos.Visible = ($name -eq 'recursos')
+    $pagePro.Visible      = ($name -eq 'pro')
+    foreach ($par in @(@($btnNavLimpieza, 'limpieza'), @($btnNavRecursos, 'recursos'), @($btnNavPro, 'pro'))) {
+        $activo = ($par[1] -eq $name)
+        $par[0].BackColor = if ($activo) { $colAccent } else { $colSurface }
+        $par[0].ForeColor = if ($activo) { $colDark } else { $colText }
+    }
+}
+$btnNavLimpieza.Add_Click({ Show-Page 'limpieza' })
+$btnNavRecursos.Add_Click({ Show-Page 'recursos' })
+$btnNavPro.Add_Click({ Show-Page 'pro' })
 
-# ----- Panel de procesos -----
+# ================= PÁGINA LIMPIEZA =================
 $lblProc = New-Object System.Windows.Forms.Label
 $lblProc.Text      = 'PROCESOS TRAGONES'
 $lblProc.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
 $lblProc.ForeColor = $colDim
-$lblProc.Location  = New-Object System.Drawing.Point(24, 360)
+$lblProc.Location  = New-Object System.Drawing.Point(0, 0)
 $lblProc.AutoSize  = $true
-$form.Controls.Add($lblProc)
+$pageLimpieza.Controls.Add($lblProc)
 
 $lvProc = New-Object System.Windows.Forms.ListView
-$lvProc.Location      = New-Object System.Drawing.Point(24, 382)
-$lvProc.Size          = New-Object System.Drawing.Size(690, 236)
+$lvProc.Location      = New-Object System.Drawing.Point(0, 22)
+$lvProc.Size          = New-Object System.Drawing.Size(660, 452)
 $lvProc.View          = 'Details'
 $lvProc.CheckBoxes    = $true
 $lvProc.FullRowSelect = $true
 $lvProc.BackColor     = $colPanel
 $lvProc.ForeColor     = $colText
 $lvProc.BorderStyle   = 'None'
-[void]$lvProc.Columns.Add('Proceso', 250)
-[void]$lvProc.Columns.Add('Instancias', 85)
-[void]$lvProc.Columns.Add('RAM (MB)', 110)
-[void]$lvProc.Columns.Add('CPU (%)', 85)
-[void]$lvProc.Columns.Add('Fondo', 70)
-$form.Controls.Add($lvProc)
+[void]$lvProc.Columns.Add('Proceso', 235)
+[void]$lvProc.Columns.Add('Instancias', 80)
+[void]$lvProc.Columns.Add('RAM (MB)', 105)
+[void]$lvProc.Columns.Add('CPU (%)', 80)
+[void]$lvProc.Columns.Add('Fondo', 65)
+$pageLimpieza.Controls.Add($lvProc)
 
 function Refresh-ProcessList {
     $form.Cursor = 'WaitCursor'
@@ -1196,28 +1087,27 @@ function Refresh-ProcessList {
     $form.Cursor = 'Default'
 }
 
-# ----- Panel de servicios -----
 $lblSvc = New-Object System.Windows.Forms.Label
 $lblSvc.Text      = 'SERVICIOS (WINDOWS + TERCEROS)'
 $lblSvc.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
 $lblSvc.ForeColor = $colDim
-$lblSvc.Location  = New-Object System.Drawing.Point(730, 360)
+$lblSvc.Location  = New-Object System.Drawing.Point(676, 0)
 $lblSvc.AutoSize  = $true
-$form.Controls.Add($lblSvc)
+$pageLimpieza.Controls.Add($lblSvc)
 
 $lvSvc = New-Object System.Windows.Forms.ListView
-$lvSvc.Location      = New-Object System.Drawing.Point(730, 382)
-$lvSvc.Size          = New-Object System.Drawing.Size(410, 236)
+$lvSvc.Location      = New-Object System.Drawing.Point(676, 22)
+$lvSvc.Size          = New-Object System.Drawing.Size(440, 452)
 $lvSvc.View          = 'Details'
 $lvSvc.CheckBoxes    = $true
 $lvSvc.FullRowSelect = $true
 $lvSvc.BackColor     = $colPanel
 $lvSvc.ForeColor     = $colText
 $lvSvc.BorderStyle   = 'None'
-[void]$lvSvc.Columns.Add('Servicio', 205)
-[void]$lvSvc.Columns.Add('Estado', 90)
-[void]$lvSvc.Columns.Add('Origen', 80)
-$form.Controls.Add($lvSvc)
+[void]$lvSvc.Columns.Add('Servicio', 225)
+[void]$lvSvc.Columns.Add('Estado', 95)
+[void]$lvSvc.Columns.Add('Origen', 85)
+$pageLimpieza.Controls.Add($lvSvc)
 
 function Refresh-ServiceList {
     $lvSvc.Items.Clear()
@@ -1253,11 +1143,10 @@ function Refresh-ServiceList {
     }
 }
 
-# ----- Botonera -----
-$btnRefresh = New-Btn 'Actualizar' 24 628 110 36 $colSurface $colText
-$btnRefresh.Add_Click({ Refresh-ProcessList })
+$btnProcAll = New-Btn 'Tildar todo' 0 490 120 36 $colSurface $colText $pageLimpieza
+$btnProcAll.Add_Click({ Set-AllChecks $lvProc })
 
-$btnKill = New-Btn 'Cerrar seleccionados' 142 628 170 36 $colRed $colDark
+$btnKill = New-Btn 'Cerrar tildados' 128 490 140 36 $colRed $colDark $pageLimpieza
 $btnKill.Add_Click({
     $marcados = @($lvProc.CheckedItems | ForEach-Object { $_.Text })
     if ($marcados.Count -eq 0) {
@@ -1268,13 +1157,13 @@ $btnKill.Add_Click({
     Refresh-ProcessList
 })
 
-$btnPurge = New-Btn 'Purgar RAM caché' 320 628 150 36 $colTeal $colDark
-$btnPurge.Add_Click({ Clear-StandbyMemory })
+$btnRefresh = New-Btn 'Actualizar' 276 490 110 36 $colSurface $colText $pageLimpieza
+$btnRefresh.Add_Click({ Refresh-ProcessList; Refresh-ServiceList })
 
-$btnStartup = New-Btn 'Apps de inicio' 478 628 130 36 $colSurface $colText
-$btnStartup.Add_Click({ Show-StartupManager })
+$btnSvcAll = New-Btn 'Tildar todo' 676 490 120 36 $colSurface $colText $pageLimpieza
+$btnSvcAll.Add_Click({ Set-AllChecks $lvSvc })
 
-$btnSvcStop = New-Btn 'Pausar tildados' 730 628 130 36 $colSurface $colText
+$btnSvcStop = New-Btn 'Pausar tildados' 804 490 140 36 $colSurface $colText $pageLimpieza
 $btnSvcStop.Add_Click({
     $marcados = @($lvSvc.CheckedItems | ForEach-Object { $_.Text })
     if ($marcados.Count -eq 0) {
@@ -1285,19 +1174,204 @@ $btnSvcStop.Add_Click({
     Refresh-ServiceList
 })
 
-$btnSvcStart = New-Btn 'Restaurar todo' 868 628 130 36 $colSurface $colText
+$btnSvcStart = New-Btn 'Restaurar todo' 952 490 130 36 $colSurface $colText $pageLimpieza
 $btnSvcStart.Add_Click({ Restore-Services })
 
-$btnPing = New-Btn 'Test ping' 1006 628 134 36 $colBlue $colDark
-$btnPing.Add_Click({ Test-PingLatency })
+# ================= PÁGINA RECURSOS =================
+$script:RamHist          = New-Object System.Collections.ArrayList
+$script:PurgeMarks       = New-Object System.Collections.ArrayList
+$script:TickNum          = 0
+$script:HistCap          = 180      # 3 minutos de historia a 1 muestra/seg
+$script:PurgadoSesionMB  = 0
+$script:TotalRamMB       = ([BoosterRam]::Query())[0]
+$script:JuegoDetectado   = $false
+$script:BoostEnCurso     = $false
 
-$btnNetOpt = New-Btn 'Optimizar PC' 730 672 200 36 $colAccent $colDark
+# Recursos GDI creados una sola vez (crearlos en cada Paint filtra handles)
+$script:cFontCap  = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+$script:cFontTiny = New-Object System.Drawing.Font('Segoe UI', 8)
+$script:cFontBig  = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+$script:cBrDim    = New-Object System.Drawing.SolidBrush($colDim)
+$script:cBrAccent = New-Object System.Drawing.SolidBrush($colAccent)
+$script:cBrGreen  = New-Object System.Drawing.SolidBrush($colGreen)
+$script:cBrHalo   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(70, $colAccent))
+$script:cPenGrid  = New-Object System.Drawing.Pen($colSurface, 1)
+$script:cPenLine  = New-Object System.Drawing.Pen($colAccent, 2.2)
+$script:cPenLine.LineJoin = 'Round'
+$script:cPenMark  = New-Object System.Drawing.Pen($colGreen, 1.4)
+$script:cPenMark.DashStyle = 'Dash'
+
+$chartPanel = New-Object System.Windows.Forms.Panel
+$chartPanel.Location  = New-Object System.Drawing.Point(0, 0)
+$chartPanel.Size      = New-Object System.Drawing.Size(1116, 300)
+$chartPanel.BackColor = $colPanel
+Set-Rounded $chartPanel 12
+# DoubleBuffered es protected en Panel: se activa por reflexión para que no parpadee
+[System.Windows.Forms.Panel].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($chartPanel, $true, $null)
+$pageRecursos.Controls.Add($chartPanel)
+
+$chartPanel.Add_Paint({
+    param($sender, $e)
+    try {
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $W = $sender.ClientSize.Width; $H = $sender.ClientSize.Height
+        $padL = 18; $padR = 84; $padT = 46; $padB = 18
+        $plotW = $W - $padL - $padR; $plotH = $H - $padT - $padB
+
+        # Título + leyenda de purgas
+        $g.DrawString('RAM EN VIVO', $cFontCap, $cBrDim, 18, 14)
+        $g.DrawLine($cPenMark, 120, 22, 142, 22)
+        $g.DrawString('purga', $cFontTiny, $cBrGreen, 146, 15)
+
+        $hist = @($script:RamHist)
+        if ($hist.Count -ge 1) {
+            # Valor actual grande, arriba a la derecha
+            $ultimo = $hist[$hist.Count - 1]
+            $txt = ('{0:N1} GB' -f ($ultimo.UsedMB / 1024))
+            $szB = $g.MeasureString($txt, $cFontBig)
+            $g.DrawString($txt, $cFontBig, $cBrAccent, $W - 18 - $szB.Width, 8)
+            $sub = ('en uso de {0:N0} GB' -f ($script:TotalRamMB / 1024))
+            $szS = $g.MeasureString($sub, $cFontTiny)
+            $g.DrawString($sub, $cFontTiny, $cBrDim, $W - 18 - $szS.Width, 8 + $szB.Height - 5)
+        }
+        if ($hist.Count -lt 2) {
+            $g.DrawString('Recolectando datos...', $cFontCap, $cBrDim, $padL, $padT + $plotH / 2)
+            return
+        }
+
+        # Escala Y dinámica: zoom al rango real para que las purgas se VEAN
+        $vals = $hist | ForEach-Object { $_.UsedMB }
+        $minV = ($vals | Measure-Object -Minimum).Minimum
+        $maxV = ($vals | Measure-Object -Maximum).Maximum
+        $rango = [Math]::Max($maxV - $minV, $script:TotalRamMB * 0.04)
+        $yMin = [Math]::Max(0, $minV - $rango * 0.25)
+        $yMax = $maxV + $rango * 0.25
+
+        # Grilla horizontal con etiquetas en GB
+        for ($i = 0; $i -le 3; $i++) {
+            $y = $padT + $plotH * $i / 3
+            $g.DrawLine($cPenGrid, $padL, $y, $padL + $plotW, $y)
+            $v = $yMax - ($yMax - $yMin) * $i / 3
+            $g.DrawString(('{0:N1} GB' -f ($v / 1024)), $cFontTiny, $cBrDim, $padL + $plotW + 8, $y - 8)
+        }
+
+        # Puntos de la curva (ventana fija anclada a la derecha, avanza como ticker)
+        $lastTick = $hist[$hist.Count - 1].Tick
+        $firstTick = $hist[0].Tick
+        $step = $plotW / [Math]::Max(1, ($script:HistCap - 1))
+        $pts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+        foreach ($m in $hist) {
+            $x = $padL + $plotW - ($lastTick - $m.Tick) * $step
+            $frac = ($m.UsedMB - $yMin) / ($yMax - $yMin)
+            $y = $padT + $plotH * (1 - $frac)
+            $pts.Add((New-Object System.Drawing.PointF($x, $y)))
+        }
+
+        # Área bajo la curva con gradiente mauve -> transparente
+        $area = New-Object System.Drawing.Drawing2D.GraphicsPath
+        $area.AddLines($pts.ToArray())
+        $area.AddLine($pts[$pts.Count - 1].X, ($padT + $plotH), $pts[0].X, ($padT + $plotH))
+        $area.CloseFigure()
+        $rect = New-Object System.Drawing.RectangleF($padL, $padT, $plotW, ($plotH + 1))
+        $grad = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, [System.Drawing.Color]::FromArgb(105, $colAccent), [System.Drawing.Color]::FromArgb(0, $colAccent), 90.0)
+        $g.FillPath($grad, $area)
+        $grad.Dispose(); $area.Dispose()
+
+        # Línea principal + punto vivo con halo
+        $g.DrawLines($cPenLine, $pts.ToArray())
+        $pu = $pts[$pts.Count - 1]
+        $g.FillEllipse($cBrHalo, ($pu.X - 7), ($pu.Y - 7), 14, 14)
+        $g.FillEllipse($cBrAccent, ($pu.X - 3.5), ($pu.Y - 3.5), 7, 7)
+
+        # Marcas de purga: línea vertical verde + GB liberados
+        foreach ($mk in @($script:PurgeMarks)) {
+            if ($mk.Tick -lt $firstTick) { continue }
+            $x = $padL + $plotW - ($lastTick - $mk.Tick) * $step
+            $g.DrawLine($cPenMark, $x, $padT, $x, ($padT + $plotH))
+            $lbl = 'PURGA ' + $mk.Texto
+            $sz = $g.MeasureString($lbl, $cFontTiny)
+            $lx = [Math]::Max($padL, [Math]::Min($x - $sz.Width / 2, $padL + $plotW - $sz.Width))
+            $g.DrawString($lbl, $cFontTiny, $cBrGreen, $lx, ($padT - 17))
+        }
+    } catch {
+        # Nunca dejar que una excepción de dibujo tumbe la app (la X roja)
+    }
+})
+
+function New-Card([string]$caption, [int]$x, $valColor) {
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Location  = New-Object System.Drawing.Point($x, 314)
+    $p.Size      = New-Object System.Drawing.Size(270, 66)
+    $p.BackColor = $colPanel
+    Set-Rounded $p 10
+    $cap = New-Object System.Windows.Forms.Label
+    $cap.Text      = $caption
+    $cap.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.25)
+    $cap.ForeColor = $colDim
+    $cap.Location  = New-Object System.Drawing.Point(14, 9)
+    $cap.AutoSize  = $true
+    $p.Controls.Add($cap)
+    $val = New-Object System.Windows.Forms.Label
+    $val.Text      = '—'
+    $val.Font      = New-Object System.Drawing.Font('Segoe UI', 15, [System.Drawing.FontStyle]::Bold)
+    $val.ForeColor = $valColor
+    $val.Location  = New-Object System.Drawing.Point(12, 27)
+    $val.AutoSize  = $true
+    $p.Controls.Add($val)
+    $pageRecursos.Controls.Add($p)
+    return $val
+}
+
+$lblCardUsada = New-Card 'RAM EN USO'          0   $colAccent
+$lblCardLibre = New-Card 'RAM LIBRE'           282 $colGreen
+$lblCardCarga = New-Card 'CARGA DE MEMORIA'    564 $colText
+$lblCardPurga = New-Card 'PURGADO ESTA SESIÓN' 846 $colTeal
+
+$btnPurge = New-Btn 'Purgar RAM caché' 0 404 240 46 $colTeal $colDark $pageRecursos
+$btnPurge.Font = New-Object System.Drawing.Font('Segoe UI', 10.5, [System.Drawing.FontStyle]::Bold)
+$btnPurge.Add_Click({ Clear-StandbyMemory })
+
+$lblPurgeHint = New-Object System.Windows.Forms.Label
+$lblPurgeHint.Text      = "Vacía la caché standby de Windows (estilo ISLC) y la convierte en RAM libre.`nMirá el gráfico: la purga queda marcada en verde y la línea cae en vivo."
+$lblPurgeHint.ForeColor = $colDim
+$lblPurgeHint.Location  = New-Object System.Drawing.Point(258, 408)
+$lblPurgeHint.Size      = New-Object System.Drawing.Size(600, 40)
+$pageRecursos.Controls.Add($lblPurgeHint)
+
+# ================= PÁGINA PRO =================
+function New-ProRow([string]$text, [int]$y, $bg, $fg, [string]$desc) {
+    $b = New-Btn $text 0 $y 210 40 $bg $fg $pagePro
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text      = $desc
+    $l.ForeColor = $colDim
+    $l.Location  = New-Object System.Drawing.Point(230, ($y + 2))
+    $l.Size      = New-Object System.Drawing.Size(880, 38)
+    $pagePro.Controls.Add($l)
+    return $b
+}
+
+$lblPro = New-Object System.Windows.Forms.Label
+$lblPro.Text      = 'HERRAMIENTAS PRO — todo con backup y reversible'
+$lblPro.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+$lblPro.ForeColor = $colDim
+$lblPro.Location  = New-Object System.Drawing.Point(0, 0)
+$lblPro.AutoSize  = $true
+$pagePro.Controls.Add($lblPro)
+
+$btnNetOpt = New-ProRow 'Optimizar PC' 30 $colAccent $colDark "Tweaks persistentes (una sola vez): red sin Nagle ni throttling, GameDVR apagado y ahorro de energía de placa de red/USB desactivado. Guarda backup de cada valor original."
 $btnNetOpt.Add_Click({ Optimize-System })
 
-$btnNetUndo = New-Btn 'Revertir tweaks' 938 672 202 36 $colSurface $colText
+$btnNetUndo = New-ProRow 'Revertir tweaks' 96 $colSurface $colText "Deshace todo lo de Optimizar PC restaurando los valores exactos que tenía tu PC, desde los backups."
 $btnNetUndo.Add_Click({ Restore-Tweaks })
 
-# ----- Registro -----
+$btnPing = New-ProRow 'Test ping' 162 $colBlue $colDark "Mide latencia promedio, mínima/máxima y jitter contra 1.1.1.1 y 8.8.8.8. Resultados en el registro. Ideal antes y después de optimizar."
+$btnPing.Add_Click({ Test-PingLatency })
+
+$btnStartup = New-ProRow 'Apps de inicio' 228 $colSurface $colText "Elegí qué programas arrancan junto con Windows. Usa la misma mecánica que el Administrador de tareas: no borra nada y es 100% reversible."
+$btnStartup.Add_Click({ Show-StartupManager })
+
+# ----- Registro (compartido entre páginas) -----
 $lblLog = New-Object System.Windows.Forms.Label
 $lblLog.Text      = 'REGISTRO'
 $lblLog.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
@@ -1346,7 +1420,7 @@ function Update-Dashboard {
     $lblCardCarga.ForeColor = if ($q[2] -ge 85) { $colRed } elseif ($q[2] -ge 70) { $colYellow } else { $colText }
     $lblCardPurga.Text = if ($script:PurgadoSesionMB -ge 1024) { '{0:N1} GB' -f ($script:PurgadoSesionMB / 1024) } else { '{0:N0} MB' -f $script:PurgadoSesionMB }
 
-    $chartPanel.Invalidate()
+    if ($pageRecursos.Visible) { $chartPanel.Invalidate() }
 }
 
 function Test-AutoGaming {
@@ -1370,9 +1444,10 @@ $timerUI.Add_Tick({
 
 # --- Arranque --------------------------------------------------
 $form.Add_Shown({
+    Show-Page 'recursos'
     Update-Dashboard
     $timerUI.Start()
-    Write-Log 'Booster v6 listo. Mirá el gráfico: cuando purgues la RAM vas a ver el bajón en vivo.' 'title'
+    Write-Log 'Booster v7 listo. Limpieza para cerrar de todo, Recursos para ver la RAM en vivo, Pro para los tweaks.' 'title'
     Refresh-ServiceList
     Refresh-ProcessList
 })
