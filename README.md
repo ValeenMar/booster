@@ -19,7 +19,7 @@ Sin instalación, sin dependencias: es un script de PowerShell con interfaz grá
    (`winget` ya viene con Windows 10/11; si no lo tenés, instalá "Instalador de aplicación" desde la Microsoft Store)
 2. Cerrá y volvé a abrir PowerShell, después:
    ```
-   git clone https://github.com/TU_USUARIO/booster.git
+   git clone https://github.com/ValeenMar/booster.git
    cd booster
    ```
 3. Doble clic en **`Booster.bat`**.
