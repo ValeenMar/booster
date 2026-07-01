@@ -43,7 +43,10 @@ Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 public static class BoosterMem {
-    [StructLayout(LayoutKind.Sequential)]
+    // Pack = 1 es obligatorio: sin eso .NET mete 4 bytes de relleno,
+    // Windows lee la estructura corrida, el privilegio no se habilita
+    // y la purga falla con 0xC0000061 aunque el proceso sea admin
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
     struct TokPriv1Luid { public int Count; public long Luid; public int Attr; }
 
     [DllImport("advapi32.dll", SetLastError = true)]
