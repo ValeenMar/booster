@@ -139,5 +139,22 @@
     "FACEIT*",
     "ExitLag*"
   ],
+  "juegos": [
+    "VALORANT*",
+    "cs2",
+    "csgo",
+    "r5apex*",
+    "FortniteClient*",
+    "League of Legends*",
+    "RocketLeague*",
+    "Overwatch*",
+    "GTA5*",
+    "RDR2*",
+    "dota2",
+    "deadlock*",
+    "EscapeFromTarkov*",
+    "FiveM*",
+    "Minecraft*"
+  ],
   "umbralRamMB": 100
 }

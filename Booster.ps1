@@ -1,5 +1,5 @@
 ﻿# ============================================================
-#  BOOSTER v4 - Optimizador gaming para despues del trabajo
+#  BOOSTER v5 - Optimizador gaming para despues del trabajo
 #  - Listas con comodines (Adobe* cierra todo lo de Adobe)
 #  - Barrido de procesos de fondo sin ventana
 #  - Pausa servicios de Windows Y de terceros (updaters, etc.)
@@ -9,6 +9,9 @@
 #    energia de NIC/USB off; un boton para revertir todo
 #  - Plan de energia Alto rendimiento en modo gaming
 #  - Timer del sistema a 0.5 ms mientras Booster este abierto
+#  - Gestor de apps de inicio (misma mecanica que el Adm. de tareas)
+#  - Purga de memoria standby estilo ISLC
+#  - Auto-modo gaming: detecta juegos y se activa solo (silencioso)
 # ============================================================
 #Requires -Version 5.1
 
@@ -35,6 +38,48 @@ public static class BoosterTimer {
 }
 "@
 
+# API nativa para purgar la lista standby de memoria (estilo ISLC)
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class BoosterMem {
+    [StructLayout(LayoutKind.Sequential)]
+    struct TokPriv1Luid { public int Count; public long Luid; public int Attr; }
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool OpenProcessToken(IntPtr h, int acc, ref IntPtr tok);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool LookupPrivilegeValue(string host, string name, ref long luid);
+    [DllImport("advapi32.dll", SetLastError = true)]
+    static extern bool AdjustTokenPrivileges(IntPtr tok, bool dis, ref TokPriv1Luid newst, int len, IntPtr prev, IntPtr rel);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("ntdll.dll")]
+    static extern int NtSetSystemInformation(int cls, ref int info, int len);
+
+    const int SE_PRIVILEGE_ENABLED = 2;
+    const int TOKEN_QUERY = 8;
+    const int TOKEN_ADJUST_PRIVILEGES = 32;
+    const int SystemMemoryListInformation = 80;
+    const int MemoryPurgeStandbyList = 4;
+
+    static void EnablePrivilege(string priv) {
+        IntPtr tok = IntPtr.Zero;
+        TokPriv1Luid tp = new TokPriv1Luid();
+        tp.Count = 1; tp.Luid = 0; tp.Attr = SE_PRIVILEGE_ENABLED;
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, ref tok);
+        LookupPrivilegeValue(null, priv, ref tp.Luid);
+        AdjustTokenPrivileges(tok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+    }
+
+    public static int PurgeStandbyList() {
+        EnablePrivilege("SeProfileSingleProcessPrivilege");
+        int cmd = MemoryPurgeStandbyList;
+        return NtSetSystemInformation(SystemMemoryListInformation, ref cmd, 4);
+    }
+}
+"@
+
 # --- Configuración -------------------------------------------
 $script:Dir        = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:ConfigPath = Join-Path $Dir 'config.json'
@@ -50,6 +95,7 @@ $defaultConfig = [ordered]@{
     serviciosTercerosAuto = @('Adobe*','AGSService','AGMService','*Update*','*update*','gupdate*','edgeupdate*','Bonjour*','TeamViewer*','AnyDesk*','SQLWriter','ClickToRunSvc')
     serviciosProtegidos = @('WinDefend','WdNisSvc','MDCoreSvc','Sense','*Defender*','Nv*','NVDisplay*','AMD*','Rtk*','Realtek*','*Audio*','vgc','vgk','EasyAntiCheat*','BEService*','FACEIT*','ESEA*','ExitLag*','Cowork*','Claude*')
     protegidos          = @('explorer','dwm','csrss','winlogon','services','lsass','svchost','System','Idle','Registry','smss','wininit','fontdrvhost','sihost','ctfmon','conhost','RuntimeBroker','ShellExperienceHost','StartMenuExperienceHost','SearchHost','TextInputHost','ApplicationFrameHost','SecurityHealth*','MsMpEng','NisSrv','audiodg','taskhostw','WmiPrvSE','dllhost','powershell','pwsh','WindowsTerminal','cmd','OpenConsole','msedgewebview2','claude*','Cowork*','nv*','NVIDIA*','amd*','Radeon*','Rtk*','Realtek*','lghub*','Logi*','Razer*','iCUE*','Corsair*','SteelSeries*','EasyAntiCheat*','BEService*','vgc','vgk','vgtray','vanguard*','FACEIT*','ExitLag*')
+    juegos              = @('VALORANT*','cs2','csgo','r5apex*','FortniteClient*','League of Legends*','RocketLeague*','Overwatch*','GTA5*','RDR2*','dota2','deadlock*','EscapeFromTarkov*','FiveM*','Minecraft*')
     umbralRamMB         = 100
 }
 
@@ -512,6 +558,171 @@ function Set-TimerResolution([bool]$activar) {
     }
 }
 
+# --- Purga de memoria standby (estilo ISLC) --------------------
+function Get-StandbyMB {
+    try {
+        $m = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
+        return [Math]::Round(($m.StandbyCacheCoreBytes + $m.StandbyCacheNormalPriorityBytes + $m.StandbyCacheReserveBytes) / 1MB)
+    } catch { return $null }
+}
+
+function Clear-StandbyMemory {
+    # La lista standby es RAM "cacheada" que Windows guarda por las dudas.
+    # Cuando se llena, algunos juegos stutterean; purgarla la devuelve como libre.
+    $antes = Get-StandbyMB
+    $libreAntes = Get-FreeRamMB
+    $r = [BoosterMem]::PurgeStandbyList()
+    if ($r -ne 0) {
+        Write-Log ("No se pudo purgar la memoria standby (código 0x{0:X8})." -f $r) 'err'
+        return
+    }
+    Start-Sleep -Milliseconds 500
+    if ($null -ne $antes) {
+        Write-Log ("Memoria standby purgada: {0:N0} MB -> {1:N0} MB." -f $antes, (Get-StandbyMB)) 'ok'
+    } else {
+        # En algunas PCs los contadores de standby no están disponibles:
+        # se informa con la RAM libre, que igual refleja el efecto
+        Write-Log ("Memoria standby purgada (RAM libre: {0:N0} MB -> {1:N0} MB)." -f $libreAntes, (Get-FreeRamMB)) 'ok'
+    }
+}
+
+# --- Gestor de apps de inicio -----------------------------------
+# Usa las claves StartupApproved, la misma mecánica que el botón
+# habilitar/deshabilitar del Administrador de tareas: no borra nada,
+# y los cambios se ven y se pueden deshacer desde ahí también.
+$script:StartupSources = @(
+    @{ Run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run';             Approved = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run';   Origen = 'Usuario' },
+    @{ Run = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run';             Approved = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run';   Origen = 'Sistema' },
+    @{ Run = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Approved = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32'; Origen = 'Sistema (32b)' }
+)
+
+function Get-StartupEnabled($approvedKey, $name) {
+    $val = Get-RegValueOrNull $approvedKey $name
+    if ($null -eq $val -or $val.Length -eq 0) { return $true }
+    return (($val[0] % 2) -eq 0)   # primer byte par = habilitado, impar = deshabilitado
+}
+
+function Set-StartupEnabled($approvedKey, $name, [bool]$habilitar) {
+    if (-not (Test-Path $approvedKey)) { New-Item -Path $approvedKey -Force | Out-Null }
+    $bytes = [byte[]]::new(12)
+    $bytes[0] = $(if ($habilitar) { 2 } else { 3 })
+    Set-ItemProperty -Path $approvedKey -Name $name -Value $bytes -Type Binary
+}
+
+function Get-StartupItems {
+    $items = @()
+    foreach ($src in $StartupSources) {
+        if (-not (Test-Path $src.Run)) { continue }
+        $p = Get-ItemProperty $src.Run
+        foreach ($prop in $p.PSObject.Properties) {
+            if (@('PSPath','PSParentPath','PSChildName','PSDrive','PSProvider') -contains $prop.Name) { continue }
+            $items += [pscustomobject]@{
+                Nombre     = $prop.Name
+                Comando    = [string]$prop.Value
+                Origen     = $src.Origen
+                Approved   = $src.Approved
+                Habilitado = Get-StartupEnabled $src.Approved $prop.Name
+            }
+        }
+    }
+    $carpetas = @(
+        @{ Path = [Environment]::GetFolderPath('Startup');       Approved = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'; Origen = 'Carpeta Inicio' },
+        @{ Path = [Environment]::GetFolderPath('CommonStartup'); Approved = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder'; Origen = 'Carpeta común' }
+    )
+    foreach ($c in $carpetas) {
+        if (-not $c.Path -or -not (Test-Path $c.Path)) { continue }
+        foreach ($f in (Get-ChildItem $c.Path -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'desktop.ini' })) {
+            $items += [pscustomobject]@{
+                Nombre     = $f.Name
+                Comando    = $f.FullName
+                Origen     = $c.Origen
+                Approved   = $c.Approved
+                Habilitado = Get-StartupEnabled $c.Approved $f.Name
+            }
+        }
+    }
+    $items | Sort-Object Nombre
+}
+
+function Show-StartupManager {
+    $items = @(Get-StartupItems)
+    $dlg = New-Object System.Windows.Forms.Form
+    $dlg.Text            = 'Booster - Apps de inicio'
+    $dlg.Size            = New-Object System.Drawing.Size(760, 540)
+    $dlg.StartPosition   = 'CenterParent'
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+    $dlg.BackColor       = $colBg
+    $dlg.ForeColor       = $colText
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text     = "Esto es lo que arranca junto con Windows. Destildá lo que no necesites`ny tocá Aplicar (mismo efecto que en el Administrador de tareas, reversible)."
+    $lbl.Location = New-Object System.Drawing.Point(15, 12)
+    $lbl.Size     = New-Object System.Drawing.Size(715, 36)
+    $dlg.Controls.Add($lbl)
+
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Location      = New-Object System.Drawing.Point(15, 55)
+    $lv.Size          = New-Object System.Drawing.Size(715, 380)
+    $lv.View          = 'Details'
+    $lv.CheckBoxes    = $true
+    $lv.FullRowSelect = $true
+    $lv.BackColor     = $colPanel
+    $lv.ForeColor     = $colText
+    $lv.BorderStyle   = 'FixedSingle'
+    [void]$lv.Columns.Add('Nombre', 210)
+    [void]$lv.Columns.Add('Origen', 95)
+    [void]$lv.Columns.Add('Comando', 385)
+    foreach ($it in $items) {
+        $item = New-Object System.Windows.Forms.ListViewItem($it.Nombre)
+        [void]$item.SubItems.Add($it.Origen)
+        [void]$item.SubItems.Add($it.Comando)
+        $item.Checked = $it.Habilitado
+        $item.Tag     = $it
+        if (-not $it.Habilitado) { $item.ForeColor = $colDim }
+        [void]$lv.Items.Add($item)
+    }
+    $dlg.Controls.Add($lv)
+
+    $btnAplicar = New-Object System.Windows.Forms.Button
+    $btnAplicar.Text         = 'Aplicar cambios'
+    $btnAplicar.Location     = New-Object System.Drawing.Point(15, 450)
+    $btnAplicar.Size         = New-Object System.Drawing.Size(220, 36)
+    $btnAplicar.BackColor    = $colAccent
+    $btnAplicar.ForeColor    = [System.Drawing.Color]::White
+    $btnAplicar.FlatStyle    = 'Flat'
+    $btnAplicar.DialogResult = 'OK'
+    $dlg.Controls.Add($btnAplicar)
+
+    $btnCerrar = New-Object System.Windows.Forms.Button
+    $btnCerrar.Text         = 'Cancelar'
+    $btnCerrar.Location     = New-Object System.Drawing.Point(510, 450)
+    $btnCerrar.Size         = New-Object System.Drawing.Size(220, 36)
+    $btnCerrar.BackColor    = $colPanel
+    $btnCerrar.ForeColor    = $colText
+    $btnCerrar.FlatStyle    = 'Flat'
+    $btnCerrar.DialogResult = 'Cancel'
+    $dlg.Controls.Add($btnCerrar)
+
+    if ($dlg.ShowDialog($form) -ne 'OK') { return }
+    $cambios = 0
+    foreach ($item in $lv.Items) {
+        $it = $item.Tag
+        if ($item.Checked -eq $it.Habilitado) { continue }
+        try {
+            Set-StartupEnabled $it.Approved $it.Nombre $item.Checked
+            $accion = if ($item.Checked) { 'habilitado' } else { 'deshabilitado' }
+            Write-Log "Inicio ${accion}: $($it.Nombre)" 'ok'
+            $cambios++
+        } catch {
+            Write-Log "No se pudo cambiar el inicio de $($it.Nombre)" 'err'
+        }
+    }
+    if ($cambios -eq 0) { Write-Log 'Apps de inicio: sin cambios.' 'info' }
+    else { Write-Log "Apps de inicio: $cambios cambio(s). Aplica en el próximo arranque de Windows." 'info' }
+}
+
 function Test-PingLatency {
     $form.Cursor = 'WaitCursor'
     Write-Log 'Midiendo latencia, dame unos segundos...' 'title'
@@ -603,8 +814,9 @@ function Show-KillPicker($items) {
     return @()
 }
 
-function Invoke-GamingMode {
-    Write-Log '=== MODO GAMING ACTIVADO ===' 'title'
+function Invoke-GamingMode([switch]$Silencioso) {
+    $script:BoostEnCurso = $true
+    Write-Log $(if ($Silencioso) { '=== MODO GAMING AUTOMÁTICO (silencioso) ===' } else { '=== MODO GAMING ACTIVADO ===' }) 'title'
     $ramAntes = Get-FreeRamMB
 
     # 1) Cierre automático de la lista segura (con comodines)
@@ -612,13 +824,17 @@ function Invoke-GamingMode {
     foreach ($g in $auto) { Close-ProcessByName $g.Name }
     if ($auto.Count -eq 0) { Write-Log 'Nada que cerrar de la lista automática.' 'info' }
 
-    # 2) Modo mixto: apps conocidas + barrido de procesos de fondo
-    $ask   = @(Get-RunningMatches $Config.preguntarAntes | ForEach-Object { $_ | Add-Member Tipo 'App' -PassThru })
-    $fondo = @(Get-BackgroundApps | ForEach-Object { $_ | Add-Member Tipo 'Fondo' -PassThru })
-    $items = @($ask + $fondo | Sort-Object RamMB -Descending)
-    if ($items.Count -gt 0) {
-        $elegidos = Show-KillPicker $items
-        foreach ($name in $elegidos) { Close-ProcessByName $name }
+    # 2) Modo mixto: apps conocidas + barrido de procesos de fondo.
+    #    En modo silencioso (auto-gaming) no se muestra el diálogo para
+    #    no interrumpir el juego: solo se cierra la lista automática.
+    if (-not $Silencioso) {
+        $ask   = @(Get-RunningMatches $Config.preguntarAntes | ForEach-Object { $_ | Add-Member Tipo 'App' -PassThru })
+        $fondo = @(Get-BackgroundApps | ForEach-Object { $_ | Add-Member Tipo 'Fondo' -PassThru })
+        $items = @($ask + $fondo | Sort-Object RamMB -Descending)
+        if ($items.Count -gt 0) {
+            $elegidos = Show-KillPicker $items
+            foreach ($name in $elegidos) { Close-ProcessByName $name }
+        }
     }
 
     # 3) Servicios pesados de Windows
@@ -645,13 +861,17 @@ function Invoke-GamingMode {
     Enable-HighPerformance
     if (-not $chkTimer.Checked) { $chkTimer.Checked = $true }
 
+    # 7) Purgar la memoria standby (los procesos recién cerrados dejan caché)
     Start-Sleep -Milliseconds 1500
+    Clear-StandbyMemory
+
     $ramDespues = Get-FreeRamMB
     $ganancia = $ramDespues - $ramAntes
     Write-Log ("=== LISTO. RAM libre: {0:N0} MB -> {1:N0} MB ({2}{3:N0} MB) ===" -f $ramAntes, $ramDespues, $(if ($ganancia -ge 0) { '+' } else { '' }), $ganancia) 'title'
 
     Refresh-ServiceList
     Refresh-ProcessList
+    $script:BoostEnCurso = $false
 }
 
 # --- GUI -------------------------------------------------------
@@ -698,6 +918,38 @@ $chkTimer.Size      = New-Object System.Drawing.Size(112, 24)
 $chkTimer.ForeColor = $colText
 $chkTimer.Add_CheckedChanged({ Set-TimerResolution $chkTimer.Checked })
 $form.Controls.Add($chkTimer)
+
+$chkAuto = New-Object System.Windows.Forms.CheckBox
+$chkAuto.Text      = 'Auto-gaming'
+$chkAuto.Location  = New-Object System.Drawing.Point(620, 55)
+$chkAuto.Size      = New-Object System.Drawing.Size(112, 24)
+$chkAuto.ForeColor = $colText
+$chkAuto.Add_CheckedChanged({
+    if ($chkAuto.Checked) {
+        Write-Log "Auto-gaming ON: al detectar un juego (lista 'juegos' del config) se activa el modo gaming solo, sin diálogos." 'info'
+    } else {
+        Write-Log 'Auto-gaming desactivado.' 'info'
+    }
+})
+$form.Controls.Add($chkAuto)
+
+# Detector de juegos: revisa cada 5 segundos si arrancó un juego
+$script:JuegoDetectado = $false
+$script:BoostEnCurso   = $false
+$timerAuto = New-Object System.Windows.Forms.Timer
+$timerAuto.Interval = 5000
+$timerAuto.Add_Tick({
+    if (-not $chkAuto.Checked -or $script:BoostEnCurso) { return }
+    $juego = Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-InList $_.Name $Config.juegos } | Select-Object -First 1
+    if ($juego -and -not $script:JuegoDetectado) {
+        $script:JuegoDetectado = $true
+        Write-Log "Juego detectado: $($juego.Name)" 'title'
+        Invoke-GamingMode -Silencioso
+    } elseif (-not $juego) {
+        $script:JuegoDetectado = $false
+    }
+})
+$timerAuto.Start()
 
 # ----- Panel de procesos -----
 $lblProc = New-Object System.Windows.Forms.Label
@@ -765,6 +1017,26 @@ $btnKill.Add_Click({
     Refresh-ProcessList
 })
 $form.Controls.Add($btnKill)
+
+$btnPurge = New-Object System.Windows.Forms.Button
+$btnPurge.Text      = 'Purgar RAM caché'
+$btnPurge.Location  = New-Object System.Drawing.Point(350, 465)
+$btnPurge.Size      = New-Object System.Drawing.Size(130, 34)
+$btnPurge.BackColor = $colPanel
+$btnPurge.ForeColor = $colText
+$btnPurge.FlatStyle = 'Flat'
+$btnPurge.Add_Click({ Clear-StandbyMemory })
+$form.Controls.Add($btnPurge)
+
+$btnStartup = New-Object System.Windows.Forms.Button
+$btnStartup.Text      = 'Apps de inicio'
+$btnStartup.Location  = New-Object System.Drawing.Point(490, 465)
+$btnStartup.Size      = New-Object System.Drawing.Size(110, 34)
+$btnStartup.BackColor = $colPanel
+$btnStartup.ForeColor = $colText
+$btnStartup.FlatStyle = 'Flat'
+$btnStartup.Add_Click({ Show-StartupManager })
+$form.Controls.Add($btnStartup)
 
 # ----- Panel de servicios -----
 $lblSvc = New-Object System.Windows.Forms.Label
@@ -917,7 +1189,7 @@ function Write-Log([string]$msg, [string]$kind = 'info') {
 
 # --- Arranque --------------------------------------------------
 $form.Add_Shown({
-    Write-Log 'Booster v4 listo. MODO GAMING activa energía y timer; Optimizar PC aplica los tweaks persistentes.' 'title'
+    Write-Log 'Booster v5 listo. Tildá Auto-gaming para que se active solo al detectar un juego.' 'title'
     Refresh-ServiceList
     Refresh-ProcessList
 })

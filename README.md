@@ -35,8 +35,21 @@ No hace falta instalar PowerShell ni nada más: Windows ya trae todo lo que Boos
 
 5. **Corta las descargas en segundo plano que meten lag**: pausa Windows Update, Delivery Optimization (que sube actualizaciones a otras PCs usando TU internet) y BITS, y limpia la caché DNS.
 6. **Activa el plan de energía Alto rendimiento** (en Equilibrado, Windows estaciona núcleos del CPU y eso genera micro-stutters) y **sube el timer del sistema a 0,5 ms** para mejor frame pacing.
+7. **Purga la memoria standby** (ver abajo).
 
 Al final te dice cuánta RAM libre ganaste. Todo lo pausado se restaura con el botón **Restaurar todo** (incluido el plan de energía) o solo al reiniciar la PC. El timer se libera al cerrar Booster.
+
+## Auto-modo gaming 🎮
+
+Tildá el checkbox **Auto-gaming** y Booster vigila cada 5 segundos si arrancó un juego de la lista `juegos` del config (Valorant, CS2, Fortnite, LoL, Apex y más — agregá los tuyos). Cuando lo detecta, dispara el modo gaming **silencioso**: hace todo lo de arriba pero sin mostrar diálogos, para no interrumpirte el juego (solo cierra la lista automática, no la de "preguntar"). Se rearma solo cuando cerrás el juego.
+
+## Apps de inicio 🚀
+
+El botón **Apps de inicio** abre un panel con todo lo que arranca junto con Windows (claves Run del registro y carpetas de Inicio). Destildás lo que no querés y aplicás. Usa la misma mecánica que el Administrador de tareas (claves *StartupApproved*): no borra nada, es 100% reversible desde el mismo panel o desde el propio Administrador de tareas. Menos cosas al arrancar = menos que limpiar después.
+
+## Purgar RAM caché 🧹
+
+La "memoria standby" es caché que Windows guarda por las dudas; cuando se llena, algunos juegos stutterean al pedir RAM. El botón **Purgar RAM caché** la vacía al instante (lo mismo que hace ISLC), y el modo gaming la purga automáticamente después de cerrar procesos. Es inofensivo: Windows la vuelve a llenar sola con el uso.
 
 ## Timer de 0,5 ms ⏱️
 
