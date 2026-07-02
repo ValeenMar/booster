@@ -156,5 +156,16 @@
     "FiveM*",
     "Minecraft*"
   ],
+  "perfiles": [
+    {
+      "juego": "VALORANT*",
+      "conservar": [
+        "Discord",
+        "WhatsApp"
+      ]
+    }
+  ],
+  "abrirEnTrabajo": [],
+  "autoPurgaLibreMB": 3072,
   "umbralRamMB": 100
 }

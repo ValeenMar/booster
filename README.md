@@ -95,6 +95,18 @@ Booster **nunca** toca, aunque los agregues a las listas por error:
 
 Los servicios solo se **pausan**, nunca se deshabilitan: al reiniciar Windows vuelven solos. Los únicos cambios persistentes son los de **Optimizar PC** (valores de registro y ahorro de energía de dispositivos, todos documentados arriba), que guardan backup de los valores originales y se deshacen enteros con **Revertir tweaks**.
 
+## Novedades v8 ⚡
+
+- **Auto-purga tipo ISLC**: toggle en Recursos; si la RAM libre baja del umbral (`autoPurgaLibreMB`), purga sola (máx. una vez cada 2 minutos) y lo marca en el gráfico.
+- **Bandeja del sistema**: minimizá y Booster queda al lado del reloj con menú de click derecho (Modo gaming, Purgar, Restaurar, Salir). Timer, auto-gaming y auto-purga siguen activos.
+- **Prioridad de CPU alta al juego**: el modo gaming (manual o automático) le sube la prioridad al juego detectado, como harías en el Administrador de tareas. Booster además baja su propia prioridad para no molestar.
+- **Ping en vivo**: segundo gráfico en Recursos con la latencia a 1.1.1.1 segundo a segundo y el jitter — ves los picos de lag en el momento.
+- **Tarjetas de GPU y VRAM** (si tenés NVIDIA, vía `nvidia-smi`): uso, temperatura y VRAM.
+- **Perfiles por juego** (`perfiles` en el config): ej. Valorant conserva Discord y WhatsApp aunque estén en la lista de cierre.
+- **Modo trabajo** (en Pro): restaura todo y abre tus apps de laburo (`abrirEnTrabajo` en el config: rutas o nombres de .exe).
+- **Limpiar basura** (en Pro): temporales de Windows + cachés de shaders viejos (DirectX/NVIDIA).
+- **Avisador de updates**: al abrir, Booster compara su versión contra este repo y te avisa si hay una nueva.
+
 ## Personalizarlo
 
 Todo se configura editando **`config.json`** con cualquier editor de texto:
@@ -107,6 +119,10 @@ Todo se configura editando **`config.json`** con cualquier editor de texto:
 | `serviciosTercerosAuto` | Patrones de servicios de terceros que el modo gaming pausa solo |
 | `serviciosProtegidos` | Servicios que **nunca** se pausan (anticheat, drivers, antivirus) |
 | `protegidos` | Procesos que Booster **nunca** cierra |
+| `juegos` | Procesos de juegos que disparan el auto-modo gaming y reciben prioridad alta |
+| `perfiles` | Por juego, qué apps conservar (ej. Valorant conserva Discord) |
+| `abrirEnTrabajo` | Apps que abre el botón Modo trabajo (rutas o nombres de .exe) |
+| `autoPurgaLibreMB` | Umbral de RAM libre (MB) que dispara la auto-purga |
 | `umbralRamMB` | RAM mínima (MB) para aparecer en la lista de tragones |
 
 Los nombres van **sin** `.exe` y aceptan comodines (`*`). Para saber el nombre de un proceso: Administrador de tareas → pestaña *Detalles*.

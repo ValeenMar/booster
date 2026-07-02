@@ -1,5 +1,5 @@
 ﻿# ============================================================
-#  BOOSTER v7 - Optimizador gaming para despues del trabajo
+#  BOOSTER v8 - Optimizador gaming para despues del trabajo
 #  - Listas con comodines (Adobe* cierra todo lo de Adobe)
 #  - Barrido de procesos de fondo sin ventana
 #  - Pausa servicios de Windows Y de terceros (updaters, etc.)
@@ -14,6 +14,9 @@
 #  - Auto-modo gaming: detecta juegos y se activa solo (silencioso)
 #  - Dashboard Catppuccin Mocha con grafico de RAM en tiempo real:
 #    las purgas se marcan en verde y se ve el bajon en vivo
+#  - v8: auto-purga tipo ISLC, bandeja del sistema, prioridad CPU
+#    alta al juego, ping en vivo, stats de GPU, perfiles por juego,
+#    modo trabajo, limpieza de basura y avisador de updates
 # ============================================================
 #Requires -Version 5.1
 
@@ -110,7 +113,11 @@ public static class BoosterRam {
 }
 "@
 
+# Booster no compite con tus juegos: baja su propia prioridad de CPU
+try { (Get-Process -Id $PID).PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
+
 # --- Configuración -------------------------------------------
+$script:BoosterVersion = 8
 $script:Dir        = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:ConfigPath = Join-Path $Dir 'config.json'
 $script:StatePath     = Join-Path $Dir '.booster_state.json'
@@ -126,6 +133,11 @@ $defaultConfig = [ordered]@{
     serviciosProtegidos = @('WinDefend','WdNisSvc','MDCoreSvc','Sense','*Defender*','Nv*','NVDisplay*','AMD*','Rtk*','Realtek*','*Audio*','vgc','vgk','EasyAntiCheat*','BEService*','FACEIT*','ESEA*','ExitLag*','Cowork*','Claude*')
     protegidos          = @('explorer','dwm','csrss','winlogon','services','lsass','svchost','System','Idle','Registry','smss','wininit','fontdrvhost','sihost','ctfmon','conhost','RuntimeBroker','ShellExperienceHost','StartMenuExperienceHost','SearchHost','TextInputHost','ApplicationFrameHost','SecurityHealth*','MsMpEng','NisSrv','audiodg','taskhostw','WmiPrvSE','dllhost','powershell','pwsh','WindowsTerminal','cmd','OpenConsole','msedgewebview2','claude*','Cowork*','nv*','NVIDIA*','amd*','Radeon*','Rtk*','Realtek*','lghub*','Logi*','Razer*','iCUE*','Corsair*','SteelSeries*','EasyAntiCheat*','BEService*','vgc','vgk','vgtray','vanguard*','FACEIT*','ExitLag*')
     juegos              = @('VALORANT*','cs2','csgo','r5apex*','FortniteClient*','League of Legends*','RocketLeague*','Overwatch*','GTA5*','RDR2*','dota2','deadlock*','EscapeFromTarkov*','FiveM*','Minecraft*')
+    perfiles            = @(
+        @{ juego = 'VALORANT*'; conservar = @('Discord','WhatsApp') }
+    )
+    abrirEnTrabajo      = @()
+    autoPurgaLibreMB    = 3072
     umbralRamMB         = 100
 }
 
@@ -137,7 +149,7 @@ if (Test-Path $ConfigPath) {
         $script:Config = [pscustomobject]$defaultConfig
     }
 } else {
-    $defaultConfig | ConvertTo-Json | Set-Content $ConfigPath -Encoding UTF8
+    $defaultConfig | ConvertTo-Json -Depth 6 | Set-Content $ConfigPath -Encoding UTF8
     $script:Config = [pscustomobject]$defaultConfig
 }
 # Si el config es de una versión anterior, completar claves nuevas
@@ -858,14 +870,80 @@ function Show-KillPicker($items) {
     return @()
 }
 
-function Invoke-GamingMode([switch]$Silencioso) {
+function Set-GamePriority {
+    # Prioridad de CPU ALTA para los juegos corriendo: lo mismo que harías
+    # a mano en el Administrador de tareas. Muere con el proceso del juego.
+    foreach ($p in (Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-InList $_.Name $Config.juegos })) {
+        try {
+            $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
+            Write-Log "Prioridad de CPU ALTA para $($p.Name) (PID $($p.Id))." 'ok'
+        } catch {
+            Write-Log "No se pudo subir la prioridad de $($p.Name) (algunos anticheat lo bloquean, no pasa nada)." 'warn'
+        }
+    }
+}
+
+function Clear-Junk {
+    # Temporales de Windows y cachés de shaders viejos. Los shaders se
+    # recompilan solos la próxima vez que abras el juego (esa primera
+    # carga puede tardar un poco más); lo que está en uso se saltea solo.
+    Write-Log '=== LIMPIEZA DE BASURA ===' 'title'
+    $objetivos = @(
+        $env:TEMP,
+        (Join-Path $env:WINDIR 'Temp'),
+        (Join-Path $env:LOCALAPPDATA 'D3DSCache'),
+        (Join-Path $env:LOCALAPPDATA 'NVIDIA\DXCache'),
+        (Join-Path $env:LOCALAPPDATA 'NVIDIA\GLCache')
+    )
+    $totalMB = 0
+    foreach ($dir in $objetivos) {
+        if (-not (Test-Path $dir)) { continue }
+        $antes = (Get-ChildItem $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        Get-ChildItem $dir -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -Confirm:$false -ErrorAction SilentlyContinue
+        $despues = (Get-ChildItem $dir -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+        $lib = [Math]::Max(0, ($antes - $despues)) / 1MB
+        $totalMB += $lib
+        Write-Log ("{0}: {1:N0} MB liberados" -f $dir, $lib) 'ok'
+    }
+    Write-Log ("Basura liberada: {0:N0} MB en total." -f $totalMB) 'title'
+}
+
+function Invoke-WorkMode {
+    # El botón inverso: restaura todo y te reabre las apps de trabajo
+    Write-Log '=== MODO TRABAJO ===' 'title'
+    Restore-Services
+    if ($chkTimer.Checked) { $chkTimer.Checked = $false }
+    if ($chkAuto.Checked)  { $chkAuto.Checked  = $false }
+    $lista = @($Config.abrirEnTrabajo | Where-Object { $_ })
+    if ($lista.Count -eq 0) {
+        Write-Log "Tip: poné rutas o nombres de tus apps de trabajo en 'abrirEnTrabajo' del config.json y este botón te las abre solas." 'info'
+    }
+    foreach ($app in $lista) {
+        try {
+            Start-Process $app
+            Write-Log "Abierto: $app" 'ok'
+        } catch {
+            Write-Log "No se pudo abrir: $app" 'err'
+        }
+    }
+    Write-Log 'De vuelta al laburo. Éxitos.' 'title'
+}
+
+function Invoke-GamingMode([switch]$Silencioso, [string[]]$Conservar = @()) {
     $script:BoostEnCurso = $true
     Write-Log $(if ($Silencioso) { '=== MODO GAMING AUTOMÁTICO (silencioso) ===' } else { '=== MODO GAMING ACTIVADO ===' }) 'title'
     $ramAntes = Get-FreeRamMB
 
-    # 1) Cierre automático de la lista segura (con comodines)
+    # 1) Cierre automático de la lista segura (con comodines).
+    #    El perfil del juego puede pedir conservar algunas apps.
     $auto = @(Get-RunningMatches $Config.cerrarSiempre)
-    foreach ($g in $auto) { Close-ProcessByName $g.Name }
+    foreach ($g in $auto) {
+        if (Test-InList $g.Name $Conservar) {
+            Write-Log "Conservado por perfil del juego: $($g.Name)" 'info'
+            continue
+        }
+        Close-ProcessByName $g.Name
+    }
     if ($auto.Count -eq 0) { Write-Log 'Nada que cerrar de la lista automática.' 'info' }
 
     # 2) Modo mixto: apps conocidas + barrido de procesos de fondo.
@@ -909,6 +987,9 @@ function Invoke-GamingMode([switch]$Silencioso) {
     Start-Sleep -Milliseconds 1500
     Clear-StandbyMemory
 
+    # 8) Si ya hay un juego corriendo, prioridad de CPU alta para él
+    Set-GamePriority
+
     $ramDespues = Get-FreeRamMB
     $ganancia = $ramDespues - $ramAntes
     Write-Log ("=== LISTO. RAM libre: {0:N0} MB -> {1:N0} MB ({2}{3:N0} MB) ===" -f $ramAntes, $ramDespues, $(if ($ganancia -ge 0) { '+' } else { '' }), $ganancia) 'title'
@@ -918,7 +999,7 @@ function Invoke-GamingMode([switch]$Silencioso) {
     $script:BoostEnCurso = $false
 }
 
-# --- GUI v7: 3 páginas (Limpieza / Recursos / Pro) ---------------
+# --- GUI v8: 3 páginas (Limpieza / Recursos / Pro) + bandeja -----
 $form = New-Object System.Windows.Forms.Form
 $form.Text            = 'Booster - Optimizador gaming'
 $form.Size            = New-Object System.Drawing.Size(1180, 850)
@@ -957,8 +1038,9 @@ function New-Btn([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $bg, $fg, $p
     return $b
 }
 
-function New-Toggle([string]$text, [int]$x, [int]$y, [int]$w) {
+function New-Toggle([string]$text, [int]$x, [int]$y, [int]$w, $parent) {
     # Checkbox con pinta de pill: gris apagado, mauve encendido
+    if (-not $parent) { $parent = $form }
     $t = New-Object System.Windows.Forms.CheckBox
     $t.Appearance = 'Button'
     $t.Text       = $text
@@ -973,7 +1055,7 @@ function New-Toggle([string]$text, [int]$x, [int]$y, [int]$w) {
     $t.Cursor     = 'Hand'
     $t.Add_CheckedChanged({ $this.ForeColor = if ($this.Checked) { $colDark } else { $colText } })
     Set-Rounded $t 18
-    $form.Controls.Add($t)
+    $parent.Controls.Add($t)
     return $t
 }
 
@@ -1186,6 +1268,10 @@ $script:PurgadoSesionMB  = 0
 $script:TotalRamMB       = ([BoosterRam]::Query())[0]
 $script:JuegoDetectado   = $false
 $script:BoostEnCurso     = $false
+$script:PingHist         = New-Object System.Collections.ArrayList
+$script:Pinger           = New-Object System.Net.NetworkInformation.Ping
+$script:UltimaAutoPurga  = -999
+$script:GpuOk            = $null -ne (Get-Command nvidia-smi -ErrorAction SilentlyContinue)
 
 # Recursos GDI creados una sola vez (crearlos en cada Paint filtra handles)
 $script:cFontCap  = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
@@ -1200,10 +1286,16 @@ $script:cPenLine  = New-Object System.Drawing.Pen($colAccent, 2.2)
 $script:cPenLine.LineJoin = 'Round'
 $script:cPenMark  = New-Object System.Drawing.Pen($colGreen, 1.4)
 $script:cPenMark.DashStyle = 'Dash'
+$script:cBrText2  = New-Object System.Drawing.SolidBrush($colText)
+$script:cBrYellow = New-Object System.Drawing.SolidBrush($colYellow)
+$script:cBrRed2   = New-Object System.Drawing.SolidBrush($colRed)
+$script:cBrBlue   = New-Object System.Drawing.SolidBrush($colBlue)
+$script:cPenPing  = New-Object System.Drawing.Pen($colBlue, 2)
+$script:cPenPing.LineJoin = 'Round'
 
 $chartPanel = New-Object System.Windows.Forms.Panel
 $chartPanel.Location  = New-Object System.Drawing.Point(0, 0)
-$chartPanel.Size      = New-Object System.Drawing.Size(1116, 300)
+$chartPanel.Size      = New-Object System.Drawing.Size(1116, 225)
 $chartPanel.BackColor = $colPanel
 Set-Rounded $chartPanel 12
 # DoubleBuffered es protected en Panel: se activa por reflexión para que no parpadee
@@ -1299,10 +1391,79 @@ $chartPanel.Add_Paint({
     }
 })
 
+# ----- Gráfico de ping en vivo -----
+$pingPanel = New-Object System.Windows.Forms.Panel
+$pingPanel.Location  = New-Object System.Drawing.Point(0, 237)
+$pingPanel.Size      = New-Object System.Drawing.Size(1116, 125)
+$pingPanel.BackColor = $colPanel
+Set-Rounded $pingPanel 12
+[System.Windows.Forms.Panel].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'NonPublic,Instance').SetValue($pingPanel, $true, $null)
+$pageRecursos.Controls.Add($pingPanel)
+
+$pingPanel.Add_Paint({
+    param($sender, $e)
+    try {
+        $g = $e.Graphics
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $W = $sender.ClientSize.Width; $H = $sender.ClientSize.Height
+        $padL = 18; $padR = 84; $padT = 32; $padB = 12
+        $plotW = $W - $padL - $padR; $plotH = $H - $padT - $padB
+
+        $g.DrawString('PING EN VIVO - 1.1.1.1', $cFontCap, $cBrDim, 18, 9)
+
+        $hist = @($script:PingHist)
+        if ($hist.Count -ge 1) {
+            $ms = $hist[$hist.Count - 1].Ms
+            $brUlt = if ($ms -lt 35) { $cBrGreen } elseif ($ms -lt 70) { $cBrText2 } elseif ($ms -lt 110) { $cBrYellow } else { $cBrRed2 }
+            $txt = ('{0} ms' -f $ms)
+            $sz = $g.MeasureString($txt, $cFontBig)
+            $g.DrawString($txt, $cFontBig, $brUlt, ($W - 18 - $sz.Width), 5)
+            $ult = @($hist | Select-Object -Last 30 | ForEach-Object { $_.Ms })
+            if ($ult.Count -gt 1) {
+                $j = 0.0
+                for ($i = 1; $i -lt $ult.Count; $i++) { $j += [Math]::Abs($ult[$i] - $ult[$i - 1]) }
+                $j = [Math]::Round($j / ($ult.Count - 1), 1)
+                $sub = "jitter $j ms"
+                $szS = $g.MeasureString($sub, $cFontTiny)
+                $g.DrawString($sub, $cFontTiny, $cBrDim, ($W - 18 - $szS.Width), (5 + $sz.Height - 5))
+            }
+        }
+        if ($hist.Count -lt 2) {
+            $g.DrawString('Recolectando datos...', $cFontCap, $cBrDim, $padL, ($padT + $plotH / 2))
+            return
+        }
+
+        $vals = $hist | ForEach-Object { $_.Ms }
+        $maxV = ($vals | Measure-Object -Maximum).Maximum
+        $yMax = [Math]::Max(40, $maxV * 1.25)
+
+        for ($i = 0; $i -le 2; $i++) {
+            $y = $padT + $plotH * $i / 2
+            $g.DrawLine($cPenGrid, $padL, $y, ($padL + $plotW), $y)
+            $v = $yMax * (1 - $i / 2)
+            $g.DrawString(('{0:N0} ms' -f $v), $cFontTiny, $cBrDim, ($padL + $plotW + 8), ($y - 8))
+        }
+
+        $lastTick = $hist[$hist.Count - 1].Tick
+        $step = $plotW / [Math]::Max(1, ($script:HistCap - 1))
+        $pts = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+        foreach ($m in $hist) {
+            $x = $padL + $plotW - ($lastTick - $m.Tick) * $step
+            $y = $padT + $plotH * (1 - ([Math]::Min($m.Ms, $yMax) / $yMax))
+            $pts.Add((New-Object System.Drawing.PointF($x, $y)))
+        }
+        $g.DrawLines($cPenPing, $pts.ToArray())
+        $pu = $pts[$pts.Count - 1]
+        $g.FillEllipse($cBrBlue, ($pu.X - 3), ($pu.Y - 3), 6, 6)
+    } catch {
+        # Nunca dejar que una excepción de dibujo tumbe la app
+    }
+})
+
 function New-Card([string]$caption, [int]$x, $valColor) {
     $p = New-Object System.Windows.Forms.Panel
-    $p.Location  = New-Object System.Drawing.Point($x, 314)
-    $p.Size      = New-Object System.Drawing.Size(270, 66)
+    $p.Location  = New-Object System.Drawing.Point($x, 374)
+    $p.Size      = New-Object System.Drawing.Size(213, 66)
     $p.BackColor = $colPanel
     Set-Rounded $p 10
     $cap = New-Object System.Windows.Forms.Label
@@ -1314,7 +1475,7 @@ function New-Card([string]$caption, [int]$x, $valColor) {
     $p.Controls.Add($cap)
     $val = New-Object System.Windows.Forms.Label
     $val.Text      = '—'
-    $val.Font      = New-Object System.Drawing.Font('Segoe UI', 15, [System.Drawing.FontStyle]::Bold)
+    $val.Font      = New-Object System.Drawing.Font('Segoe UI', 13.5, [System.Drawing.FontStyle]::Bold)
     $val.ForeColor = $valColor
     $val.Location  = New-Object System.Drawing.Point(12, 27)
     $val.AutoSize  = $true
@@ -1323,20 +1484,30 @@ function New-Card([string]$caption, [int]$x, $valColor) {
     return $val
 }
 
-$lblCardUsada = New-Card 'RAM EN USO'          0   $colAccent
-$lblCardLibre = New-Card 'RAM LIBRE'           282 $colGreen
-$lblCardCarga = New-Card 'CARGA DE MEMORIA'    564 $colText
-$lblCardPurga = New-Card 'PURGADO ESTA SESIÓN' 846 $colTeal
+$lblCardUsada = New-Card 'RAM EN USO'     0   $colAccent
+$lblCardLibre = New-Card 'RAM LIBRE'      225 $colGreen
+$lblCardGpu   = New-Card 'GPU'            450 $colBlue
+$lblCardVram  = New-Card 'VRAM'           675 $colBlue
+$lblCardPurga = New-Card 'PURGADO SESIÓN' 900 $colTeal
 
-$btnPurge = New-Btn 'Purgar RAM caché' 0 404 240 46 $colTeal $colDark $pageRecursos
+$btnPurge = New-Btn 'Purgar RAM caché' 0 456 220 46 $colTeal $colDark $pageRecursos
 $btnPurge.Font = New-Object System.Drawing.Font('Segoe UI', 10.5, [System.Drawing.FontStyle]::Bold)
 $btnPurge.Add_Click({ Clear-StandbyMemory })
 
+$chkAutoPurga = New-Toggle 'Auto-purga' 232 461 130 $pageRecursos
+$chkAutoPurga.Add_CheckedChanged({
+    if ($chkAutoPurga.Checked) {
+        Write-Log ("Auto-purga ON: si la RAM libre baja de {0:N0} MB purgo solo (máximo una vez cada 2 minutos)." -f $Config.autoPurgaLibreMB) 'info'
+    } else {
+        Write-Log 'Auto-purga desactivada.' 'info'
+    }
+})
+
 $lblPurgeHint = New-Object System.Windows.Forms.Label
-$lblPurgeHint.Text      = "Vacía la caché standby de Windows (estilo ISLC) y la convierte en RAM libre.`nMirá el gráfico: la purga queda marcada en verde y la línea cae en vivo."
+$lblPurgeHint.Text      = "Purga manual o automática: la caché standby se convierte en RAM libre (estilo ISLC) y cada purga queda`nmarcada en verde en el gráfico. El umbral de la auto-purga es 'autoPurgaLibreMB' del config.json."
 $lblPurgeHint.ForeColor = $colDim
-$lblPurgeHint.Location  = New-Object System.Drawing.Point(258, 408)
-$lblPurgeHint.Size      = New-Object System.Drawing.Size(600, 40)
+$lblPurgeHint.Location  = New-Object System.Drawing.Point(378, 458)
+$lblPurgeHint.Size      = New-Object System.Drawing.Size(738, 42)
 $pageRecursos.Controls.Add($lblPurgeHint)
 
 # ================= PÁGINA PRO =================
@@ -1370,6 +1541,12 @@ $btnPing.Add_Click({ Test-PingLatency })
 
 $btnStartup = New-ProRow 'Apps de inicio' 228 $colSurface $colText "Elegí qué programas arrancan junto con Windows. Usa la misma mecánica que el Administrador de tareas: no borra nada y es 100% reversible."
 $btnStartup.Add_Click({ Show-StartupManager })
+
+$btnWork = New-ProRow 'Modo trabajo' 294 $colGreen $colDark "El botón inverso: restaura servicios y plan de energía, apaga timer y auto-gaming, y te abre las apps de la lista 'abrirEnTrabajo' del config.json. El lunes empieza con un click."
+$btnWork.Add_Click({ Invoke-WorkMode })
+
+$btnJunk = New-ProRow 'Limpiar basura' 360 $colYellow $colDark "Borra temporales de Windows y cachés de shaders viejos (DirectX/NVIDIA). Los shaders se regeneran solos: la primera carga del juego puede tardar un toque más, y de paso cura stutters por caché corrupta."
+$btnJunk.Add_Click({ Clear-Junk })
 
 # ----- Registro (compartido entre páginas) -----
 $lblLog = New-Object System.Windows.Forms.Label
@@ -1414,13 +1591,53 @@ function Update-Dashboard {
     [void]$script:RamHist.Add([pscustomobject]@{ Tick = $script:TickNum; UsedMB = $usada })
     while ($script:RamHist.Count -gt $script:HistCap) { $script:RamHist.RemoveAt(0) }
 
+    # Ping por segundo (timeout corto para no trabar la interfaz)
+    $ms = 250
+    try {
+        $reply = $script:Pinger.Send('1.1.1.1', 250)
+        if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) { $ms = [int]$reply.RoundtripTime }
+    } catch {}
+    [void]$script:PingHist.Add([pscustomobject]@{ Tick = $script:TickNum; Ms = $ms })
+    while ($script:PingHist.Count -gt $script:HistCap) { $script:PingHist.RemoveAt(0) }
+
     $lblCardUsada.Text = '{0:N1} GB' -f ($usada / 1024)
+    $lblCardUsada.ForeColor = if ($q[2] -ge 85) { $colRed } elseif ($q[2] -ge 70) { $colYellow } else { $colAccent }
     $lblCardLibre.Text = '{0:N1} GB' -f ($q[1] / 1024)
-    $lblCardCarga.Text = '{0}%' -f $q[2]
-    $lblCardCarga.ForeColor = if ($q[2] -ge 85) { $colRed } elseif ($q[2] -ge 70) { $colYellow } else { $colText }
     $lblCardPurga.Text = if ($script:PurgadoSesionMB -ge 1024) { '{0:N1} GB' -f ($script:PurgadoSesionMB / 1024) } else { '{0:N0} MB' -f $script:PurgadoSesionMB }
 
-    if ($pageRecursos.Visible) { $chartPanel.Invalidate() }
+    # Auto-purga tipo ISLC: RAM libre bajo el umbral -> purga sola
+    # (con enfriamiento de 2 minutos para no purgar en loop)
+    if ($chkAutoPurga.Checked -and $q[1] -lt [long]$Config.autoPurgaLibreMB -and ($script:TickNum - $script:UltimaAutoPurga) -ge 120) {
+        $script:UltimaAutoPurga = $script:TickNum
+        Write-Log ("Auto-purga: RAM libre en {0:N0} MB (umbral {1:N0} MB)." -f $q[1], $Config.autoPurgaLibreMB) 'warn'
+        Clear-StandbyMemory
+    }
+
+    if ($pageRecursos.Visible) {
+        $chartPanel.Invalidate()
+        $pingPanel.Invalidate()
+    }
+}
+
+function Update-GpuStats {
+    # nvidia-smi tarda ~100ms: se llama cada 5 segundos y sin ventana
+    if (-not $script:GpuOk) { return }
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName               = 'nvidia-smi'
+        $psi.Arguments              = '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits'
+        $psi.UseShellExecute        = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.CreateNoWindow         = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $out = $proc.StandardOutput.ReadLine()
+        [void]$proc.WaitForExit(1500)
+        if ($out) {
+            $p = $out.Split(',')
+            $lblCardGpu.Text  = ('{0}%  {1}°C' -f $p[0].Trim(), $p[3].Trim())
+            $lblCardVram.Text = ('{0:N1}/{1:N1} GB' -f ([double]$p[1].Trim() / 1024), ([double]$p[2].Trim() / 1024))
+        }
+    } catch { $script:GpuOk = $false }
 }
 
 function Test-AutoGaming {
@@ -1428,11 +1645,30 @@ function Test-AutoGaming {
     $juego = Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-InList $_.Name $Config.juegos } | Select-Object -First 1
     if ($juego -and -not $script:JuegoDetectado) {
         $script:JuegoDetectado = $true
-        Write-Log "Juego detectado: $($juego.Name)" 'title'
-        Invoke-GamingMode -Silencioso
+        # Perfil por juego: qué apps conservar para este juego puntual
+        $perfil = @($Config.perfiles) | Where-Object { $_ -and $juego.Name -like $_.juego } | Select-Object -First 1
+        $conservar = if ($perfil) { @($perfil.conservar) } else { @() }
+        $extra = if ($perfil) { " (perfil: conserva $($conservar -join ', '))" } else { '' }
+        Write-Log "Juego detectado: $($juego.Name)$extra" 'title'
+        Invoke-GamingMode -Silencioso -Conservar $conservar
     } elseif (-not $juego) {
         $script:JuegoDetectado = $false
     }
+}
+
+function Test-BoosterUpdate {
+    # Compara la versión local contra el repo de GitHub (una vez, al abrir)
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $wc = New-Object System.Net.WebClient
+        $head = $wc.DownloadString('https://raw.githubusercontent.com/ValeenMar/booster/master/Booster.ps1')
+        if ($head -match 'BOOSTER v(\d+)') {
+            $remota = [int]$Matches[1]
+            if ($remota -gt $script:BoosterVersion) {
+                Write-Log "Hay una versión nueva de Booster (v$remota, tenés la v$($script:BoosterVersion)): hacé git pull o bajá el ZIP del repo." 'warn'
+            }
+        }
+    } catch {}
 }
 
 $timerUI = New-Object System.Windows.Forms.Timer
@@ -1440,18 +1676,60 @@ $timerUI.Interval = 1000
 $timerUI.Add_Tick({
     Update-Dashboard
     if ($script:TickNum % 5 -eq 0) { Test-AutoGaming }
+    if ($script:TickNum % 5 -eq 2) { Update-GpuStats }
+    if ($script:TickNum -eq 3)     { Test-BoosterUpdate }
+})
+
+# ----- Bandeja del sistema -----
+# Minimizar manda a Booster al lado del reloj: el timer de 0,5 ms,
+# el auto-gaming y la auto-purga siguen laburando en segundo plano.
+$notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+$notifyIcon.Icon    = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $PSHOME 'powershell.exe'))
+$notifyIcon.Text    = 'Booster'
+$notifyIcon.Visible = $true
+
+function Show-FromTray {
+    $form.Show()
+    $form.WindowState = 'Normal'
+    $form.Activate()
+}
+
+$trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+[void]$trayMenu.Items.Add('Mostrar Booster', $null, { Show-FromTray })
+[void]$trayMenu.Items.Add('Modo gaming', $null, { Show-FromTray; Invoke-GamingMode })
+[void]$trayMenu.Items.Add('Purgar RAM caché', $null, { Clear-StandbyMemory })
+[void]$trayMenu.Items.Add('Restaurar todo', $null, { Restore-Services })
+[void]$trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+[void]$trayMenu.Items.Add('Salir', $null, { $form.Close() })
+$notifyIcon.ContextMenuStrip = $trayMenu
+$notifyIcon.Add_DoubleClick({ Show-FromTray })
+
+$script:BalloonMostrado = $false
+$form.Add_Resize({
+    if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
+        $form.Hide()
+        if (-not $script:BalloonMostrado) {
+            $script:BalloonMostrado = $true
+            $notifyIcon.ShowBalloonTip(2500, 'Booster', 'Sigo acá abajo: timer 0,5 ms, auto-gaming y auto-purga quedan activos. Doble clic para volver.', [System.Windows.Forms.ToolTipIcon]::Info)
+        }
+    }
 })
 
 # --- Arranque --------------------------------------------------
 $form.Add_Shown({
     Show-Page 'recursos'
     Update-Dashboard
+    Update-GpuStats
     $timerUI.Start()
-    Write-Log 'Booster v7 listo. Limpieza para cerrar de todo, Recursos para ver la RAM en vivo, Pro para los tweaks.' 'title'
+    Write-Log 'Booster v8 listo. Minimizá y quedo en la bandeja, al lado del reloj, laburando solo.' 'title'
     Refresh-ServiceList
     Refresh-ProcessList
 })
 
-$form.Add_FormClosed({ $timerUI.Stop() })
+$form.Add_FormClosed({
+    $timerUI.Stop()
+    $notifyIcon.Visible = $false
+    $notifyIcon.Dispose()
+})
 
 [void]$form.ShowDialog()
