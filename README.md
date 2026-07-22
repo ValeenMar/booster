@@ -107,6 +107,38 @@ Los servicios solo se **pausan**, nunca se deshabilitan: al reiniciar Windows vu
 - **Limpiar basura** (en Pro): temporales de Windows + cachés de shaders viejos (DirectX/NVIDIA).
 - **Avisador de updates**: al abrir, Booster compara su versión contra este repo y te avisa si hay una nueva.
 
+## 🚨 Booster Rescate — cuenta de Discord que manda spam sola
+
+Si una cuenta empieza a mandar sola mensajes de "regalo de MrBeast", casinos cripto o Nitro gratis, **no le adivinaron la contraseña: le robaron el token de sesión**. El token es la llave que prueba que ya iniciaste sesión, así que el atacante entra sin contraseña y el 2FA no lo frena.
+
+Ejecutá **`Rescate.bat`** (o el botón *Rescate antimalware* en la página Pro de Booster). Busca las mañas concretas de esta familia de malware:
+
+| Qué revisa | Por qué |
+|---|---|
+| `index.js` del cliente de Discord | El truco estrella: lo parchean para robar el token cada vez que abrís Discord. Se compara contra el contenido legítimo exacto |
+| Exclusiones y estado de Defender | El malware se auto-excluye del antivirus o lo apaga |
+| Arranque de Windows (Run, RunOnce, carpetas de Inicio) | Persistencia. Solo marca lo que está **sin firma digital** en carpetas de usuario |
+| Tareas programadas | Solo las que tienen comando codificado (`-enc`) o descarga en línea: una tarea normal con `-File` no se toca |
+| Procesos corriendo | Solo desde Temp o sueltos en la raíz de AppData, que es el patrón del dropper |
+| Webhooks de Discord dentro de archivos | Por ahí se manda el token robado. Un **ejecutable** con un webhook adentro es casi siempre un stealer |
+| Archivo `hosts` y persistencia WMI | Bloqueo de antivirus y ejecución oculta |
+
+**Nada se borra**: todo va a la carpeta `Cuarentena` con un manifiesto JSON, y el botón *Restaurar cuarentena* deshace la limpieza completa. Nunca toca nada dentro de `C:\Windows`.
+
+### El orden importa (y casi todos lo hacen al revés)
+
+1. Cerrar Discord del todo.
+2. **Limpiar la PC primero** (esta herramienta + escaneo de Defender). Si cambiás la contraseña con el ladrón todavía corriendo, se roba el token nuevo.
+3. Reiniciar.
+4. **Recién ahí**, cambiar la contraseña **desde otro dispositivo** (el celular) y marcar "cerrar sesión en todos los dispositivos". Eso es lo que invalida el token robado.
+5. Activar 2FA, revisar *Aplicaciones autorizadas* y sacar lo desconocido.
+
+El botón **Guía de la cuenta** tiene los pasos completos adentro de la app.
+
+> Si el escaneo no encuentra nada, es probable que el token se lo hayan sacado sin infectar la PC (páginas truchas de "Nitro gratis", QR falsos). Los pasos 4 y 5 siguen siendo exactamente lo que hay que hacer.
+
+**No es un antivirus completo**: es un cazador dirigido a esta amenaza. Corré igual el escaneo de Microsoft Defender (y para casos jodidos, el *Examen sin conexión*, que escanea antes de que arranque Windows).
+
 ## Personalizarlo
 
 Todo se configura editando **`config.json`** con cualquier editor de texto:

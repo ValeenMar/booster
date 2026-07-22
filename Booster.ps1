@@ -1548,6 +1548,17 @@ $btnWork.Add_Click({ Invoke-WorkMode })
 $btnJunk = New-ProRow 'Limpiar basura' 360 $colYellow $colDark "Borra temporales de Windows y cachés de shaders viejos (DirectX/NVIDIA). Los shaders se regeneran solos: la primera carga del juego puede tardar un toque más, y de paso cura stutters por caché corrupta."
 $btnJunk.Add_Click({ Clear-Junk })
 
+$btnRescate = New-ProRow 'Rescate antimalware' 426 $colRed $colDark "¿La cuenta de Discord manda spam sola (regalos de MrBeast, casinos cripto)? Le robaron el token. Abre Booster Rescate: busca el cliente de Discord parcheado y la persistencia del ladron, y te da la guia para recuperar la cuenta."
+$btnRescate.Add_Click({
+    $rescate = Join-Path $script:Dir 'Rescate.ps1'
+    if (-not (Test-Path $rescate)) {
+        Write-Log 'No encuentro Rescate.ps1 al lado de Booster.ps1. Baja el repo completo.' 'err'
+        return
+    }
+    Write-Log 'Abriendo Booster Rescate...' 'title'
+    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$rescate`""
+})
+
 # ----- Registro (compartido entre páginas) -----
 $lblLog = New-Object System.Windows.Forms.Label
 $lblLog.Text      = 'REGISTRO'
