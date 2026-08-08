@@ -1,0 +1,47 @@
+# Unidad instanciada del hostbot Aura. Cada instancia N vive en
+# /opt/wc3/hostbot/instances/N/ con su propio aura.cfg (renderizado por
+# install/40-render-configs.sh) porque Aura lee "aura.cfg" del directorio de
+# trabajo (hardcodeado en src/aura.cpp, no acepta ruta por argumento).
+#
+# Alta de una instancia nueva:
+#   1. crear config/hostbot/instance-3.env en el repo (puertos unicos)
+#   2. correr install/40-render-configs.sh
+#   3. systemctl enable --now wc3-hostbot@3
+
+[Unit]
+Description=Aura hostbot de WC3, instancia %i
+After=network-online.target pvpgn.service
+Wants=network-online.target
+# El bot reintenta la conexion al PvPGN por si cae; no encadenamos Requires=.
+
+[Service]
+Type=simple
+User=wc3
+Group=wc3
+WorkingDirectory=/opt/wc3/hostbot/instances/%i
+ExecStart=/opt/wc3/hostbot/aura++
+Restart=on-failure
+RestartSec=10
+
+# --- Limites de recursos (VPS de 2 GB, varias instancias) --------------------
+MemoryMax=384M
+TasksMax=64
+
+# --- Hardening ---------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# La instancia escribe su sqlite (aura.dbs) y los mapcfgs compartidos
+ReadWritePaths=/opt/wc3/hostbot/instances/%i /opt/wc3/hostbot/mapcfgs
+# Mapas y MPQ del juego: solo lectura
+ReadOnlyPaths=/opt/wc3/maps /opt/wc3/mpq
+
+[Install]
+WantedBy=multi-user.target

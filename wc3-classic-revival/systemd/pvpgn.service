@@ -1,0 +1,43 @@
+# Unidad de PvPGN (bnetd). Instalada por install/10-build-pvpgn.sh en
+# /etc/systemd/system/pvpgn.service.
+# bnetd corre en foreground (-f) y systemd gestiona el proceso; los logs de
+# aplicacion quedan en /opt/wc3/pvpgn/var/pvpgn/bnetd.log y el stdout/stderr
+# en journalctl -u pvpgn.
+
+[Unit]
+Description=PvPGN Battle.net emulator (bnetd)
+After=network-online.target mysql.service
+Wants=network-online.target
+# PvPGN necesita MySQL levantado, pero no queremos que un reinicio de MySQL
+# tumbe PvPGN: por eso After= sin Requires= (bnetd reintenta la conexion).
+
+[Service]
+Type=simple
+User=wc3
+Group=wc3
+ExecStart=/opt/wc3/pvpgn/sbin/bnetd -f -c /opt/wc3/pvpgn/etc/pvpgn/bnetd.conf
+Restart=on-failure
+RestartSec=5
+
+# --- Limites de recursos (VPS de 2 GB) --------------------------------------
+MemoryMax=512M
+TasksMax=128
+
+# --- Hardening ---------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# bnetd escribe cuentas/logs/estado bajo var/pvpgn
+ReadWritePaths=/opt/wc3/pvpgn/var
+# Los MPQ del juego son de solo lectura para todo el stack
+ReadOnlyPaths=/opt/wc3/mpq
+
+[Install]
+WantedBy=multi-user.target

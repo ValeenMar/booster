@@ -1,0 +1,347 @@
+# ============================================================================
+# Registry de mapas de wc3-classic-revival
+# ----------------------------------------------------------------------------
+# LA fuente de verdad del catalogo. Un entry por mapa; los campos desconocidos
+# quedan en null (no se inventan). scripts/inspect-map.py --update-registry
+# completa size_mb/slots/teams desde el .w3x sin pisar lo editado a mano.
+#
+# return_bug_risk: riesgo de que el mapa NO cargue en 1.24+ por el fix del
+# return bug de JASS (ver docs/version-1.26a.md):
+#   verde    = version objetivo hecha para 1.24+ o confirmada andando
+#   amarillo = sin confirmar; probar en fase 1
+#   rojo     = linaje 2006-2009 poco mantenido; probable que solo ande una
+#              version vieja o ninguna en 1.26a
+#
+# Los mapas .w3x van en este directorio en el SERVER, nunca en git.
+# ============================================================================
+
+maps:
+  # ------------------------------------------------------------------ AoS ---
+  - name: DotA Allstars
+    aliases: [DotA, Defense of the Ancients]
+    category: aos
+    target_version: "6.83d"
+    versions_known: ["6.61b", "6.79e", "6.83d"]
+    size_mb: null
+    slots: 10
+    teams: 2
+    min_patch: "1.24b"
+    return_bug_risk: verde
+    status: pendiente
+    notes: >-
+      Anterior a 6.61b NO carga en 1.24+ (return bug). 6.83d es la ultima gran
+      version clasica y esta hecha para 1.24b+; es la eleccion segura en 1.26a.
+    source_url: null
+
+  - name: Angel Arena
+    aliases: [Angel Arena Allstars, Angel Arena X]
+    category: aos
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 2
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: >-
+      Familia enorme de variantes (Allstars, X, Eclipse...). Las de era
+      2004-2008 probablemente pisen el return bug; buscar una variante
+      mantenida post-2009 y validar en fase 1.
+    source_url: null
+
+  - name: Warlock
+    aliases: [Warlock Brawl]
+    category: aos
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: null
+    min_patch: null
+    return_bug_risk: verde
+    status: pendiente
+    notes: >-
+      Mantenido activamente hasta ~2012 con versiones especificas para 1.24+;
+      elegir una version tardia (>= 0.85) y validar igual.
+    source_url: null
+
+  - name: Bleach vs One Piece
+    aliases: [BvO, Bleach vs One Piece Compilation]
+    category: aos
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 2
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: >-
+      Las versiones tardias (3.x+) son post-2010 y suelen andar en 1.26a, pero
+      casi seguro superan los 4 MB: no se transfiere in-lobby en 1.26a, hay
+      que distribuirlo por map pack (ver docs/mapas.md).
+    source_url: null
+
+  - name: DBZ Tribute
+    aliases: [Dragon Ball Z Tribute, DBZ Tribute Elite, DBZ Tribute Ultra]
+    category: aos
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: null
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: >-
+      Linaje largo (Elite/Ultra). Versiones post-2010 deberian cargar en
+      1.26a; probable >4 MB, distribuir por map pack.
+    source_url: null
+
+  - name: Naruto Ninpou Storm
+    aliases: [Naruto Ninpou, NNS]
+    category: aos
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 2
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: >-
+      AoS de anime clasico; verificar version exacta y tamano (probable >4 MB,
+      map pack).
+    source_url: null
+
+  - name: Naruto Shinobi Battle Royal
+    aliases: [NSBR, Naruto Battle Royal]
+    category: aos
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: null
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: Verificar version y tamano; probable >4 MB (map pack).
+    source_url: null
+
+  - name: Anime Fight
+    aliases: [Anime Fight Ultimate, AF]
+    category: aos
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: null
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: >-
+      Existen varios mapas con este nombre; identificar el linaje correcto
+      antes de validar. Probable >4 MB (map pack).
+    source_url: null
+
+  - name: Custom Hero Arena
+    aliases: [CHA]
+    category: aos
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 2
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: >-
+      Muchas variantes (no confundir con Custom Hero Line Wars ni Custom Hero
+      Survival). Elegir la variante y version en fase 1.
+    source_url: null
+
+  # ---------------------------------------------------------------- Arena ---
+  - name: Pudge Wars
+    aliases: [Pudge Wars Original]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: 12
+    teams: 2
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: >-
+      El original es era 2006-2008 (riesgo alto); existen remakes post-2009
+      que si cargan en 1.26a. Preferir un remake mantenido.
+    source_url: null
+
+  - name: Pudge Wars Advanced
+    aliases: [PWA]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: 12
+    teams: 2
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: Variante mas mantenida que el original; validar version exacta.
+    source_url: null
+
+  - name: Axe Wars
+    aliases: [Mogul Kahn Wars]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 2
+    min_patch: null
+    return_bug_risk: rojo
+    status: pendiente
+    notes: >-
+      OJO: circulan varios mapas distintos llamados "Axe Wars" que NO son el
+      spinoff de Pudge Wars. El spinoff es un mod chico y poco mantenido:
+      zona roja para 1.24+.
+    source_url: null
+
+  - name: Mirana Wars
+    aliases: [Priestess of the Moon Wars, POTM Wars]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 2
+    min_patch: null
+    return_bug_risk: rojo
+    status: pendiente
+    notes: >-
+      Spinoff de Pudge Wars, mod chico poco mantenido: probable victima del
+      return bug. Plan B: buscar remakes post-2009.
+    source_url: null
+
+  - name: Nevermore Wars
+    aliases: [SF Wars, Shadow Fiend Wars]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 2
+    min_patch: null
+    return_bug_risk: rojo
+    status: pendiente
+    notes: Spinoff de Pudge Wars, misma zona roja que Mirana Wars.
+    source_url: null
+
+  - name: Bounty Hunter Wars
+    aliases: [Gondar Wars, BH Wars]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 2
+    min_patch: null
+    return_bug_risk: rojo
+    status: pendiente
+    notes: Spinoff de Pudge Wars, misma zona roja que Mirana Wars.
+    source_url: null
+
+  - name: Sheep Tag
+    aliases: [Sheep Tag ReVoLuTiOn, Sheep Tag Relapse]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: 12
+    teams: 2
+    min_patch: null
+    return_bug_risk: verde
+    status: pendiente
+    notes: >-
+      Comunidad activa mucho despues de 1.24; las variantes ReVoLuTiOn /
+      Relapse tienen versiones para 1.24+. Elegir variante en fase 1.
+    source_url: null
+
+  - name: Run Kitty Run
+    aliases: [RKR]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 1
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: Mapa chico; las versiones tardias deberian andar. Validar en fase 1.
+    source_url: null
+
+  - name: Uther Party
+    aliases: [Uther Party 2, UP]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 1
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: >-
+      El original es 2005 (riesgo return bug); Uther Party 2 tuvo versiones
+      posteriores. Empezar por UP2.
+    source_url: null
+
+  - name: Footmen Frenzy
+    aliases: [Footies, Footman Frenzy]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: 12
+    teams: 4
+    min_patch: null
+    return_bug_risk: verde
+    status: pendiente
+    notes: >-
+      Muy mantenido por la comunidad; hay versiones claramente hechas para
+      1.24+. Elegir la version estandar de la epoca (5.x) y validar.
+    source_url: null
+
+  - name: Dodgeball
+    aliases: [Dodgeball Extreme, Dodgeball Arena]
+    category: arena
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 2
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: Varios linajes con el mismo nombre; identificar el buscado en fase 1.
+    source_url: null
+
+  # ------------------------------------------------------------------- TD ---
+  - name: Marvel TD
+    aliases: [Marvel Tower Defense]
+    category: td
+    target_version: null
+    versions_known: null
+    size_mb: null
+    slots: null
+    teams: 1
+    min_patch: null
+    return_bug_risk: amarillo
+    status: pendiente
+    notes: >-
+      Unico TD del catalogo. Circulo ~2008-2010; verificar que la version
+      conseguida cargue en 1.26a y su tamano.
+    source_url: null

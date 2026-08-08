@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "wc3-classic-revival map registry",
+  "description": "Esquema de maps/registry.yaml. Los campos desconocidos van en null, no se inventan.",
+  "type": "object",
+  "required": ["maps"],
+  "additionalProperties": false,
+  "properties": {
+    "maps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "category", "return_bug_risk", "status"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "aliases": {
+            "type": ["array", "null"],
+            "items": { "type": "string" }
+          },
+          "category": { "enum": ["aos", "arena", "td"] },
+          "target_version": {
+            "type": ["string", "null"],
+            "description": "Version del mapa que buscamos, ej '6.83d'"
+          },
+          "versions_known": {
+            "type": ["array", "null"],
+            "items": { "type": "string" }
+          },
+          "size_mb": { "type": ["number", "null"], "minimum": 0 },
+          "slots": { "type": ["integer", "null"], "minimum": 1, "maximum": 12 },
+          "teams": { "type": ["integer", "null"], "minimum": 1, "maximum": 12 },
+          "min_patch": {
+            "type": ["string", "null"],
+            "description": "Parche minimo del juego en el que carga, ej '1.24b'"
+          },
+          "return_bug_risk": {
+            "enum": ["verde", "amarillo", "rojo"],
+            "description": "Riesgo de que el mapa no cargue en 1.24+ por el fix del return bug de JASS"
+          },
+          "status": { "enum": ["pendiente", "descargado", "validado", "descartado"] },
+          "notes": { "type": ["string", "null"] },
+          "source_url": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}

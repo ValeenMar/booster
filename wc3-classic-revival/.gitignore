@@ -1,0 +1,43 @@
+# --- Secretos ---------------------------------------------------------------
+.env
+*.env.local
+
+# --- Material con copyright: NUNCA entra al repo -----------------------------
+# Mapas de W3 (van en maps/ en el server, no en git)
+*.w3x
+*.w3m
+# Archivos del juego
+*.mpq
+*.MPQ
+*.exe
+*.dll
+war3.exe
+game.dll
+storm.dll
+War3Patch.mpq
+war3patch.mpq
+# Instaladores y packs
+*.zip
+*.rar
+*.7z
+*.iso
+
+# --- Artefactos de build / runtime ------------------------------------------
+build/
+*.o
+*.so
+aura++
+bnetd
+aura.dbs
+*.log
+*.tar.gz
+backups/
+
+# --- Editor / SO -------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
