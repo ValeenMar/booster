@@ -28,20 +28,42 @@ No hace falta instalar PowerShell ni nada más: Windows ya trae todo lo que Boos
 
 ## Qué hace el MODO GAMING
 
-1. **Cierra automáticamente** las apps de la lista `cerrarSiempre`. Las listas aceptan comodines: `Adobe*` cierra AdobeIPCBroker, AdobeCollabSync, AcroTray y cualquier otra cosa que empiece con "Adobe".
-2. **Te pregunta** por las apps de `preguntarAntes` (navegadores, Discord, Spotify...) **y además hace un barrido automático de procesos de fondo**: cualquier programa de terceros sin ventana visible que esté haciendo bulto aparece en el diálogo para que lo cierres, aunque no esté en ninguna lista. Destildás lo que quieras conservar.
+1. **Cierra automáticamente** las apps de la lista `cerrarSiempre`. Primero les pide que cierren solas (como apretar la X) y solo fuerza lo que sigue vivo a los 2,5 segundos. Las listas aceptan comodines: `Adobe*` cierra AdobeIPCBroker, AdobeCollabSync, AcroTray y cualquier otra cosa que empiece con "Adobe".
+2. **Te pregunta** por las apps de `preguntarAntes` (navegadores, Discord, Spotify...) **y además hace un barrido automático de procesos de fondo**: cualquier programa de terceros sin ventana visible que esté haciendo bulto aparece en el diálogo, aunque no esté en ninguna lista. Tus apps vienen tildadas; lo que encontró el barrido viene **destildado**: se cierra solo si lo elegís vos.
 3. **Pausa servicios pesados de Windows** (SysMain, indexado de búsqueda, telemetría, cola de impresión).
 4. **Pausa servicios de terceros** que matcheen `serviciosTercerosAuto`: updaters de Adobe/Google/Edge/LG, Bonjour, TeamViewer, etc.
 
 5. **Corta las descargas en segundo plano que meten lag**: pausa Windows Update, Delivery Optimization (que sube actualizaciones a otras PCs usando TU internet) y BITS, y limpia la caché DNS.
-6. **Activa el plan de energía Alto rendimiento** (en Equilibrado, Windows estaciona núcleos del CPU y eso genera micro-stutters) y **sube el timer del sistema a 0,5 ms** para mejor frame pacing.
+6. **Activa el plan de energía Alto rendimiento** (en Equilibrado, Windows estaciona núcleos del CPU y eso genera micro-stutters).
 7. **Purga la memoria standby** (ver abajo).
+8. **Prioridad alta al juego** y, si lo pediste, **afinidad a los núcleos P** (ver "Solo P-cores").
 
-Al final te dice cuánta RAM libre ganaste. Todo lo pausado se restaura con el botón **Restaurar todo** (incluido el plan de energía) o solo al reiniciar la PC. El timer se libera al cerrar Booster.
+Al final te dice cuánta RAM libre ganaste. Todo lo pausado se restaura con el botón **Restaurar todo** (incluido el plan de energía) o solo al reiniciar la PC.
 
 ## Auto-modo gaming 🎮
 
-Tildá el checkbox **Auto-gaming** y Booster vigila cada 5 segundos si arrancó un juego de la lista `juegos` del config (Valorant, CS2, Fortnite, LoL, Apex y más — agregá los tuyos). Cuando lo detecta, dispara el modo gaming **silencioso**: hace todo lo de arriba pero sin mostrar diálogos, para no interrumpirte el juego (solo cierra la lista automática, no la de "preguntar"). Se rearma solo cuando cerrás el juego.
+Tildá el toggle **Auto-gaming** (o poné `"autoGaming": true` en el config para que arranque prendido). Booster se entera de que abriste un juego de la lista `juegos` por un **evento de Windows**, sin recorrer procesos cada 5 segundos. Cuando lo detecta, dispara el modo gaming **silencioso**: hace todo lo de arriba pero sin mostrar diálogos (solo cierra la lista automática, no la de "preguntar"). Se rearma solo cuando cerrás el juego.
+
+## Modo sigilo 🤫
+
+Con un juego abierto (con o sin Auto-gaming), Booster **se calla**: deja de pinguear, de consultar la GPU y de dibujar gráficos, y su timer pasa de 1 a 5 segundos. Lo único que sigue es leer la RAM para la auto-purga. Un optimizador no debería ser una fuente de micro-cortes. Al cerrar el juego vuelve solo al monitoreo normal.
+
+## Blindaje de servers 🛡️
+
+Si en la misma PC hosteás cosas (un server de Counter, Minecraft, MU, un túnel Playit, una base de datos), Booster **nunca** las cierra ni las pausa: ni en modo gaming, ni desde el barrido de fondo, ni tildándolas a mano. Los procesos van en `servidores` y los servicios en `serviciosServidores` del config. En la lista de tragones aparecen en azul con la marca `SERVER`.
+
+## Solo P-cores (CPUs híbridas) 🧠
+
+En los Intel de 12ª generación en adelante hay núcleos P (rendimiento) y E (eficiencia). Windows 10 no los reparte bien y a veces manda hilos del juego a los E. El toggle **Solo P-cores** (solo aparece si tu CPU es híbrido) fija el juego a los núcleos P. Se aplica en el acto al juego abierto, así que **probalo**: prendelo y apagalo mirando los FPS mínimos. No sirve en todos los juegos y algunos anticheat (Vanguard) lo bloquean. Para dejarlo fijo: `"soloPCores": true` en el config, o por juego dentro de `perfiles`.
+
+## Diagnóstico 🔎
+
+La página **Diagnóstico** hace dos cosas, las dos de solo lectura:
+
+- **Audita lo que de verdad mueve la aguja**: si el monitor está a los Hz que da, si la RAM corre con XMP/EXPO, plan de energía, modo de juego, GameDVR, aceleración del mouse, integridad de memoria, espacio en disco, y qué quedó pausado.
+- **Mide antes y después**: *Medir base* toma 15 segundos del ruido de fondo de la PC (CPU que consume lo que no es el juego, tiempo en DPC/interrupciones de drivers, cambios de contexto, procesos, servicios, RAM libre, ping y jitter). Aplicás el modo gaming, tocás *Medir y comparar* y te dice métrica por métrica si quedó MEJOR, PEOR o igual. Diferencias de menos del 5% se marcan como ruido, no como mejora.
+
+No mide FPS (eso lo ve mejor el contador del propio juego): mide lo que Booster puede cambiar.
 
 ## Apps de inicio 🚀
 
@@ -61,14 +83,19 @@ La interfaz es un dashboard oscuro (paleta [Catppuccin Mocha](https://catppuccin
 
 ## Timer de 0,5 ms ⏱️
 
-El timer por defecto de Windows corre a 15,6 ms; con el checkbox **Timer 0,5 ms** (arriba a la derecha) Booster lo fuerza a la máxima precisión, igual que herramientas como TimerResolution o ISLC. Mejora el frame pacing y la consistencia de frames en varios juegos. Es riesgo cero: dura solo mientras Booster esté abierto — al cerrarlo, Windows lo devuelve al valor normal automáticamente. El modo gaming lo activa solo (dejá Booster abierto mientras jugás).
+El toggle **Timer 0,5 ms** pide la máxima precisión del timer de Windows mientras Booster esté abierto. Ya no se prende solo con el modo gaming: es opcional (`"timer05": true` en el config para que arranque prendido). Lo que hay que saber:
+
+- **Windows 10 (2004 en adelante)**: el pedido vale solo para el proceso que lo hace. Medido en 22H2: con Booster pidiendo 0,5 ms, un `Sleep(1)` en otro proceso sigue tardando ~15 ms. No le llega al juego.
+- **Windows 11**: por defecto pasa lo mismo, pero existe la clave `GlobalTimerResolutionRequests` que lo vuelve global. El botón **Timer global (Win11)** de la página Pro la activa con backup (pide reiniciar) y **Revertir tweaks** la deshace. Con la clave activa, el toggle sí le llega al juego.
+
+Los juegos que necesitan timer fino ya piden 1 ms por su cuenta.
 
 ## Tweaks persistentes: Optimizar PC 🔧
 
 Tres botones abajo del panel de servicios:
 
 - **Optimizar PC** (se aplica una sola vez, con backup de cada valor original):
-  - **Red**: desactiva el *algoritmo de Nagle* y el *delayed ACK* (Windows agrupa paquetes chicos antes de mandarlos: bueno para descargas, malo para el ping) y el *throttling de red* que Windows aplica cuando reproducís audio/video. Si un valor ya está igual o mejor (por otro tweak previo), no lo toca.
+  - **Red**: desactiva el *algoritmo de Nagle* y el *delayed ACK* (Windows agrupa paquetes chicos antes de mandarlos; ojo: esto solo afecta a juegos que van por **TCP** — Valorant, CS2, Apex o LoL usan UDP y no lo notan) y el *throttling de red* que Windows aplica cuando reproducís audio/video. Si un valor ya está igual o mejor (por otro tweak previo), no lo toca.
   - **GameDVR / Game Bar**: Windows graba gameplay en segundo plano *por defecto* para el "grabar últimos 30 segundos" — eso es GPU trabajando en algo que no es tu juego. Se desactiva.
   - **Ahorro de energía de red y USB**: Windows apaga la placa de red y los puertos USB para ahorrar energía, lo que mete picos de latencia y afecta el polling del mouse. Se desactiva en la NIC activa y los dispositivos USB.
 - **Revertir tweaks**: deshace TODO usando los backups (`.booster_net_backup.json` y `.booster_tweaks.json`) y restaura los valores exactos que tenías.
@@ -92,13 +119,25 @@ Booster **nunca** toca, aunque los agregues a las listas por error:
 - **Anticheats**: Vanguard (vgc/vgk), EasyAntiCheat, BattlEye, FACEIT — si los matás no podés entrar al juego.
 - **Drivers y software de periféricos**: NVIDIA, AMD, Realtek, Logitech G HUB, Razer, Corsair iCUE, SteelSeries — los necesitás mientras jugás.
 - **ExitLag** y similares que usás para jugar.
+- **Lo que hosteás**: servers de juegos, túneles, bases de datos, WSL/Docker, Tailscale (listas `servidores` y `serviciosServidores`).
 
 Los servicios solo se **pausan**, nunca se deshabilitan: al reiniciar Windows vuelven solos. Los únicos cambios persistentes son los de **Optimizar PC** (valores de registro y ahorro de energía de dispositivos, todos documentados arriba), que guardan backup de los valores originales y se deshacen enteros con **Revertir tweaks**.
 
+## Novedades v9 🛡️
+
+- **Blindaje de servers**, **cierre amable** antes de forzar y barrido de fondo destildado por defecto.
+- **Modo sigilo** mientras jugás y detección de juegos por evento en vez de sondeo.
+- **Solo P-cores** para CPUs híbridas.
+- **Página Diagnóstico** con medición antes/después.
+- El ping en vivo ahora es asíncrono (ya no puede trabar la interfaz).
+- **Interfaz renovada**: botones e interruptores con bordes suaves y estado al pasar el mouse, barra de título y listas en oscuro, ícono propio.
+- **Arreglado**: al minimizar a la bandeja Booster se cerraba.
+- El timer de 0,5 ms pasa a ser un toggle opcional, con **Timer global** para que en Windows 11 le llegue al juego.
+
 ## Novedades v8 ⚡
 
-- **Auto-purga tipo ISLC**: toggle en Recursos; si la RAM libre baja del umbral (`autoPurgaLibreMB`), purga sola (máx. una vez cada 2 minutos) y lo marca en el gráfico.
-- **Bandeja del sistema**: minimizá y Booster queda al lado del reloj con menú de click derecho (Modo gaming, Purgar, Restaurar, Salir). Timer, auto-gaming y auto-purga siguen activos.
+- **Auto-purga tipo ISLC**: toggle en Recursos; si la RAM libre baja del umbral (`autoPurgaLibreMB`), purga sola (máx. una vez cada 2 minutos) y lo marca en el gráfico. Viene apagada: con RAM de sobra no suma.
+- **Bandeja del sistema**: al minimizar **o cerrar con la X**, Booster queda en los íconos ocultos al lado del reloj, con menú de click derecho (Modo gaming, Purgar, Restaurar, Salir de Booster). Auto-gaming y auto-purga siguen activos. Para cerrarlo de verdad: click derecho en el ícono > *Salir de Booster*. Si preferís que la X cierre, poné `"cerrarALaBandeja": false` en el config. Solo se abre una instancia a la vez.
 - **Prioridad de CPU alta al juego**: el modo gaming (manual o automático) le sube la prioridad al juego detectado, como harías en el Administrador de tareas. Booster además baja su propia prioridad para no molestar.
 - **Ping en vivo**: segundo gráfico en Recursos con la latencia a 1.1.1.1 segundo a segundo y el jitter — ves los picos de lag en el momento.
 - **Tarjetas de GPU y VRAM** (si tenés NVIDIA, vía `nvidia-smi`): uso, temperatura y VRAM.
@@ -152,7 +191,10 @@ Todo se configura editando **`config.json`** con cualquier editor de texto:
 | `serviciosProtegidos` | Servicios que **nunca** se pausan (anticheat, drivers, antivirus) |
 | `protegidos` | Procesos que Booster **nunca** cierra |
 | `juegos` | Procesos de juegos que disparan el auto-modo gaming y reciben prioridad alta |
-| `perfiles` | Por juego, qué apps conservar (ej. Valorant conserva Discord) |
+| `perfiles` | Por juego, qué apps conservar (ej. Valorant conserva Discord) y, opcional, `"soloPCores": true` |
+| `servidores` | Procesos que hosteás: **nunca** se cierran ni aparecen en el barrido |
+| `serviciosServidores` | Servicios que hosteás: **nunca** se pausan |
+| `autoGaming` / `soloPCores` / `timer05` | `true` para que el toggle arranque prendido |
 | `abrirEnTrabajo` | Apps que abre el botón Modo trabajo (rutas o nombres de .exe) |
 | `autoPurgaLibreMB` | Umbral de RAM libre (MB) que dispara la auto-purga |
 | `umbralRamMB` | RAM mínima (MB) para aparecer en la lista de tragones |

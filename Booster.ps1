@@ -1,5 +1,12 @@
 ﻿# ============================================================
-#  BOOSTER v8 - Optimizador gaming para despues del trabajo
+#  BOOSTER v9 - Optimizador gaming para despues del trabajo
+#  - v9: blindaje de servers (nunca cierra ni pausa lo que hosteas),
+#    cierre amable antes de forzar, modo sigilo mientras jugas,
+#    deteccion de juegos por evento, afinidad a P-cores en CPUs
+#    hibridas y pagina Diagnostico con medicion antes/despues.
+#    El timer de 0.5 ms queda como toggle opcional: desde Windows 10
+#    2004 es por proceso; en Windows 11 llega al juego con la clave
+#    global (boton 'Timer global' de la pagina Pro).
 #  - Listas con comodines (Adobe* cierra todo lo de Adobe)
 #  - Barrido de procesos de fondo sin ventana
 #  - Pausa servicios de Windows Y de terceros (updaters, etc.)
@@ -8,7 +15,6 @@
 #  - Tweaks persistentes con backup: GameDVR off y ahorro de
 #    energia de NIC/USB off; un boton para revertir todo
 #  - Plan de energia Alto rendimiento en modo gaming
-#  - Timer del sistema a 0.5 ms mientras Booster este abierto
 #  - Gestor de apps de inicio (misma mecanica que el Adm. de tareas)
 #  - Purga de memoria standby estilo ISLC
 #  - Auto-modo gaming: detecta juegos y se activa solo (silencioso)
@@ -31,7 +37,18 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-# API nativa para el timer de alta precisión (estilo TimerResolution/ISLC)
+# Una sola instancia: si Booster ya está abierto (seguramente en la bandeja),
+# no se abre otro encima.
+$creado = $false
+$script:Mutex = New-Object System.Threading.Mutex($true, 'Local\BoosterGamingApp', [ref]$creado)
+if (-not $creado) {
+    [System.Windows.Forms.MessageBox]::Show("Booster ya está abierto.`nBuscalo en los íconos ocultos, al lado del reloj (doble clic para mostrarlo).", 'Booster', 'OK', 'Information') | Out-Null
+    exit
+}
+
+# Timer de alta precisión (opcional, toggle "Timer 0,5 ms").
+# Ojo: desde Windows 10 2004 el pedido vale solo para el proceso que lo hace;
+# para que le llegue al juego hace falta Windows 11 + la clave global.
 Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -40,8 +57,119 @@ public static class BoosterTimer {
     public static extern int NtQueryTimerResolution(out uint min, out uint max, out uint current);
     [DllImport("ntdll.dll")]
     public static extern int NtSetTimerResolution(uint desired, bool set, out uint current);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_POWER_THROTTLING_STATE { public uint Version; public uint ControlMask; public uint StateMask; }
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetProcessInformation(IntPtr h, int cls, ref PROCESS_POWER_THROTTLING_STATE info, int size);
+
+    // Windows 11 ignora el pedido de timer de un proceso con la ventana
+    // minimizada u oculta (Booster en la bandeja). Esto le pide que lo respete igual.
+    public static bool KeepWhenHidden() {
+        try {
+            PROCESS_POWER_THROTTLING_STATE s = new PROCESS_POWER_THROTTLING_STATE();
+            s.Version = 1; s.ControlMask = 0x4; s.StateMask = 0;   // IGNORE_TIMER_RESOLUTION apagado
+            return SetProcessInformation(GetCurrentProcess(), 4, ref s, Marshal.SizeOf(typeof(PROCESS_POWER_THROTTLING_STATE)));
+        } catch { return false; }
+    }
 }
 "@
+
+# Topología del CPU: en los híbridos (Intel 12ª gen en adelante) separa
+# núcleos P (rendimiento) de E (eficiencia) para poder fijar el juego a los P
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class BoosterCpu {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetLogicalProcessorInformationEx(int rel, IntPtr buf, ref uint len);
+
+    static int Bits(long v) { int n = 0; ulong u = (ulong)v; while (u != 0) { n += (int)(u & 1); u >>= 1; } return n; }
+
+    // Devuelve [mascaraP, mascaraTodos, nucleosP, nucleosE]; mascaraP = 0 si el CPU no es híbrido
+    public static long[] Query() {
+        uint len = 0;
+        GetLogicalProcessorInformationEx(0, IntPtr.Zero, ref len);
+        if (len == 0) return new long[] { 0, 0, 0, 0 };
+        IntPtr buf = Marshal.AllocHGlobal((int)len);
+        try {
+            if (!GetLogicalProcessorInformationEx(0, buf, ref len)) return new long[] { 0, 0, 0, 0 };
+            List<long> masks = new List<long>();
+            List<int> eff = new List<int>();
+            int off = 0;
+            while (off < (int)len) {
+                int size = Marshal.ReadInt32(buf, off + 4);
+                if (size <= 0) break;
+                // PROCESSOR_RELATIONSHIP: Flags(8) EfficiencyClass(9) ... GroupMask[0].Mask(32) Group(40)
+                if (Marshal.ReadInt16(buf, off + 40) == 0) {
+                    masks.Add(Marshal.ReadInt64(buf, off + 32));
+                    eff.Add(Marshal.ReadByte(buf, off + 9));
+                }
+                off += size;
+            }
+            long all = 0; int maxEff = 0, minEff = 255; bool haySmt = false, hayNoSmt = false;
+            for (int i = 0; i < masks.Count; i++) {
+                all |= masks[i];
+                if (eff[i] > maxEff) maxEff = eff[i];
+                if (eff[i] < minEff) minEff = eff[i];
+                if (Bits(masks[i]) > 1) haySmt = true; else hayNoSmt = true;
+            }
+            long p = 0; int np = 0;
+            if (maxEff != minEff) {
+                // Windows informa la clase de eficiencia: los P son la clase más alta
+                for (int i = 0; i < masks.Count; i++) if (eff[i] == maxEff) { p |= masks[i]; np++; }
+            } else if (haySmt && hayNoSmt) {
+                // Sin clase informada: en Alder/Raptor Lake los P tienen 2 hilos y los E, 1
+                for (int i = 0; i < masks.Count; i++) if (Bits(masks[i]) > 1) { p |= masks[i]; np++; }
+            }
+            return new long[] { p, all, np, (p == 0 ? 0 : masks.Count - np) };
+        } finally { Marshal.FreeHGlobal(buf); }
+    }
+}
+"@
+
+# Aviso de arranque de procesos por evento de WMI: Booster se entera de que
+# abriste un juego sin tener que recorrer la lista de procesos cada 5 segundos.
+# Corre en un hilo aparte y deja los nombres en una cola que lee el timer.
+try {
+    Add-Type -ReferencedAssemblies 'System', 'System.Management' -TypeDefinition @"
+using System;
+using System.Management;
+using System.Diagnostics;
+using System.Collections.Generic;
+public static class BoosterWatch {
+    static ManagementEventWatcher w;
+    static readonly object gate = new object();
+    static List<string> pend = new List<string>();
+    public static bool Start() {
+        try {
+            w = new ManagementEventWatcher(new WqlEventQuery("SELECT ProcessID FROM Win32_ProcessStartTrace"));
+            w.EventArrived += OnStart;
+            w.Start();
+            return true;
+        } catch { return false; }
+    }
+    static void OnStart(object s, EventArrivedEventArgs e) {
+        try {
+            int pid = Convert.ToInt32(e.NewEvent["ProcessID"]);
+            string n = Process.GetProcessById(pid).ProcessName;
+            lock (gate) { if (pend.Count < 500) pend.Add(n); }
+        } catch { }
+        finally { try { e.NewEvent.Dispose(); } catch { } }
+    }
+    public static string[] Drain() {
+        lock (gate) { string[] r = pend.ToArray(); pend.Clear(); return r; }
+    }
+    public static void Stop() {
+        try { if (w != null) { w.Stop(); w.Dispose(); w = null; } } catch { }
+    }
+}
+"@
+    $script:WatchDisponible = $true
+} catch { $script:WatchDisponible = $false }
 
 # API nativa para purgar la lista standby de memoria (estilo ISLC)
 Add-Type -TypeDefinition @"
@@ -117,7 +245,8 @@ public static class BoosterRam {
 try { (Get-Process -Id $PID).PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
 
 # --- Configuración -------------------------------------------
-$script:BoosterVersion = 8
+$script:BoosterVersion = 9
+$script:MedicionesPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '.booster_mediciones.json'
 $script:Dir        = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:ConfigPath = Join-Path $Dir 'config.json'
 $script:StatePath     = Join-Path $Dir '.booster_state.json'
@@ -139,6 +268,14 @@ $defaultConfig = [ordered]@{
     abrirEnTrabajo      = @()
     autoPurgaLibreMB    = 3072
     umbralRamMB         = 100
+    # v9 - Blindaje: lo que hosteás. Booster NUNCA cierra estos procesos ni
+    # pausa estos servicios, ni en modo gaming ni a mano desde las listas.
+    servidores          = @('hlds*','srcds*','java','playit*','MUnique*','OpenMU*','dotnet','postgres*','pg_ctl','mysqld*','mariadbd*','docker*','com.docker*','wsl*','vmmem*','tailscale*','node','python*','nginx','caddy','cloudflared','sshd','n8n*')
+    serviciosServidores = @('Tailscale*','WSL*','WslInstaller','LxssManager','vmcompute','vmms','postgresql*','MySQL*','MariaDB*','playit*','docker*','com.docker*','sshd','LGHUB*')
+    autoGaming          = $false   # arrancar con Auto-gaming ya encendido
+    soloPCores          = $false   # arrancar con Solo P-cores ya encendido (CPUs híbridas)
+    timer05             = $false   # arrancar con Timer 0,5 ms ya encendido
+    cerrarALaBandeja    = $true    # la X manda a la bandeja en vez de cerrar
 }
 
 if (Test-Path $ConfigPath) {
@@ -181,6 +318,15 @@ function Test-InList([string]$name, $patterns) {
     return $false
 }
 
+function Test-Servidor([string]$name) {
+    # Lo que hosteás (Counter, MU, Minecraft, Playit, bases de datos...)
+    return (Test-InList $name $Config.servidores)
+}
+
+function Test-Intocable([string]$name) {
+    return ((Test-InList $name $Config.protegidos) -or (Test-Servidor $name))
+}
+
 function Get-FreeRamMB {
     [Math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1024)
 }
@@ -201,7 +347,7 @@ function Get-ProcessSnapshot {
             if ($t1.ContainsKey($p.Id)) { $cpuMs = $p.TotalProcessorTime.TotalMilliseconds - $t1[$p.Id] }
         } catch {}
         if (-not $grupos.ContainsKey($p.Name)) {
-            $grupos[$p.Name] = [pscustomobject]@{ Name = $p.Name; Count = 0; RamMB = 0.0; CpuMs = 0.0; TieneVentana = $false }
+            $grupos[$p.Name] = [pscustomobject]@{ Name = $p.Name; Count = 0; RamMB = 0.0; CpuMs = 0.0; TieneVentana = $false; EsServidor = (Test-Servidor $p.Name) }
         }
         $g = $grupos[$p.Name]
         $g.Count++
@@ -221,7 +367,7 @@ function Get-RunningMatches($patterns) {
     Get-Process | Where-Object {
         $_.Id -ne $PID -and
         (Test-InList $_.Name $patterns) -and
-        -not (Test-InList $_.Name $Config.protegidos)
+        -not (Test-Intocable $_.Name)
     } | Group-Object Name | ForEach-Object {
         [pscustomobject]@{
             Name  = $_.Name
@@ -236,7 +382,7 @@ function Get-BackgroundApps {
     $winDir = $env:WINDIR
     Get-Process | Where-Object {
         $_.Id -ne $PID -and $_.Path -and $_.Path -notlike "$winDir*" -and
-        -not (Test-InList $_.Name $Config.protegidos) -and
+        -not (Test-Intocable $_.Name) -and
         -not (Test-InList $_.Name $Config.cerrarSiempre) -and
         -not (Test-InList $_.Name $Config.preguntarAntes)
     } | Group-Object Name | ForEach-Object {
@@ -257,22 +403,62 @@ function Get-ThirdPartyServices {
     Get-CimInstance Win32_Service -Filter "State='Running'" | Where-Object {
         $path = if ($_.PathName) { $_.PathName.Trim('"') } else { '' }
         $path -and $path -notlike "$winDir*" -and
-        -not (Test-InList $_.Name $Config.serviciosProtegidos) -and
-        -not (Test-InList $_.DisplayName $Config.serviciosProtegidos)
+        -not (Test-ServicioIntocable $_.Name $_.DisplayName)
     }
 }
 
-function Close-ProcessByName([string]$name) {
-    if (Test-InList $name $Config.protegidos) {
-        Write-Log "Ignorado (protegido): $name" 'warn'
-        return
+function Test-ServicioIntocable([string]$name, [string]$display = '') {
+    foreach ($lista in @($Config.serviciosProtegidos, $Config.serviciosServidores)) {
+        if (Test-InList $name $lista) { return $true }
+        if ($display -and (Test-InList $display $lista)) { return $true }
     }
-    $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
-    if (-not $procs) { return }
-    $ram = [Math]::Round(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1MB)
-    Stop-Process -Name $name -Force -ErrorAction SilentlyContinue
-    Write-Log "Cerrado: $name (~$ram MB)" 'ok'
+    return $false
 }
+
+function Close-ProcessesByName([string[]]$names) {
+    # Cierre en dos tiempos: primero se le pide a cada app que cierre sola
+    # (como apretar la X: guarda sesión, no corrompe perfiles) y recién lo
+    # que sigue vivo después de la espera se mata a la fuerza.
+    $objetivo = @()
+    foreach ($name in @($names | Where-Object { $_ } | Select-Object -Unique)) {
+        if (Test-Servidor $name) {
+            Write-Log "Blindado (server): $name no se toca." 'warn'
+            continue
+        }
+        if (Test-InList $name $Config.protegidos) {
+            Write-Log "Ignorado (protegido): $name" 'warn'
+            continue
+        }
+        $procs = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+        if ($procs.Count -eq 0) { continue }
+        $objetivo += [pscustomobject]@{
+            Name  = $name
+            RamMB = [Math]::Round(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1MB)
+        }
+        foreach ($p in $procs) {
+            if ($p.MainWindowHandle -ne 0) { try { [void]$p.CloseMainWindow() } catch {} }
+        }
+    }
+    if ($objetivo.Count -eq 0) { return }
+
+    $limite = (Get-Date).AddMilliseconds(2500)
+    while ((Get-Date) -lt $limite) {
+        $vivos = @($objetivo | Where-Object { Get-Process -Name $_.Name -ErrorAction SilentlyContinue })
+        if ($vivos.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 200
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+    foreach ($o in $objetivo) {
+        if (Get-Process -Name $o.Name -ErrorAction SilentlyContinue) {
+            Stop-Process -Name $o.Name -Force -ErrorAction SilentlyContinue
+            Write-Log "Cerrado (forzado): $($o.Name) (~$($o.RamMB) MB)" 'ok'
+        } else {
+            Write-Log "Cerrado: $($o.Name) (~$($o.RamMB) MB)" 'ok'
+        }
+    }
+}
+
+function Close-ProcessByName([string]$name) { Close-ProcessesByName @($name) }
 
 function Get-State {
     # Estado de lo que Booster pausó/cambió en esta sesión (para restaurar).
@@ -314,6 +500,10 @@ function Stop-ServicesByName([string[]]$names) {
     $detenidos = @()
     foreach ($svcName in $names) {
         $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($svc -and (Test-InList $svcName $Config.serviciosServidores)) {
+            Write-Log "Blindado (server): el servicio $svcName no se pausa." 'warn'
+            continue
+        }
         if ($svc -and $svc.Status -eq 'Running') {
             try {
                 Stop-Service -Name $svcName -Force -ErrorAction Stop
@@ -533,6 +723,16 @@ function Restore-Tweaks {
         Write-Log 'GameDVR restaurado a su configuración original.' 'ok'
     }
 
+    if ($tweaks.PSObject.Properties.Name -contains 'timerGlobal') {
+        $val = $tweaks.timerGlobal.previo
+        if ($null -eq $val) {
+            Remove-ItemProperty -Path $TimerGlobalKey -Name 'GlobalTimerResolutionRequests' -ErrorAction SilentlyContinue
+        } else {
+            Set-ItemProperty -Path $TimerGlobalKey -Name 'GlobalTimerResolutionRequests' -Value ([int]$val) -Type DWord
+        }
+        Write-Log 'Timer global restaurado a su valor original (se completa al reiniciar).' 'ok'
+    }
+
     if ($tweaks.PSObject.Properties.Name -contains 'ahorroDispositivos') {
         $instancias = @($tweaks.ahorroDispositivos)
         $n = 0
@@ -589,20 +789,97 @@ function Enable-HighPerformance {
     }
 }
 
+# --- Timer de 0,5 ms (opcional) ---------------------------------
+# Medido en Windows 10 22H2: con OTRO proceso pidiendo 0,5 ms, un Sleep(1)
+# sigue tardando ~15 ms en el que no lo pidió. O sea: en Windows 10 (2004+)
+# esto no le llega al juego. En Windows 11 sí, pero solo con la clave
+# GlobalTimerResolutionRequests (botón 'Timer global' de la página Pro).
+$script:TimerGlobalKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'
+$script:EsWin11 = ([Environment]::OSVersion.Version.Build -ge 22000)
+
+function Test-TimerGlobal {
+    return ($script:EsWin11 -and ((Get-RegValueOrNull $TimerGlobalKey 'GlobalTimerResolutionRequests') -eq 1))
+}
+
 function Set-TimerResolution([bool]$activar) {
-    # El timer por defecto de Windows es de 15.6 ms; subirlo a 0.5 ms
-    # mejora el frame pacing. Dura mientras el proceso viva: al cerrar
-    # Booster, Windows lo libera solo.
     $min = [uint32]0; $max = [uint32]0; $cur = [uint32]0
     [void][BoosterTimer]::NtQueryTimerResolution([ref]$min, [ref]$max, [ref]$cur)
     $out = [uint32]0
-    if ($activar) {
-        [void][BoosterTimer]::NtSetTimerResolution($max, $true, [ref]$out)
-        Write-Log ("Timer del sistema: {0:N2} ms -> {1:N2} ms (dura mientras Booster esté abierto)." -f ($cur / 10000), ($out / 10000)) 'ok'
-    } else {
+    if (-not $activar) {
         [void][BoosterTimer]::NtSetTimerResolution($max, $false, [ref]$out)
         Write-Log 'Timer del sistema liberado.' 'info'
+        return
     }
+    [void][BoosterTimer]::NtSetTimerResolution($max, $true, [ref]$out)
+    [void][BoosterTimer]::KeepWhenHidden()
+    Write-Log ("Timer pedido: {0:N2} ms -> {1:N2} ms (dura mientras Booster esté abierto)." -f ($cur / 10000), ($out / 10000)) 'ok'
+    if (Test-TimerGlobal) {
+        Write-Log 'Clave global activa: el timer le llega a todos los procesos, incluido el juego.' 'ok'
+    } elseif ($script:EsWin11) {
+        Write-Log "Ojo: en Windows 11 el timer es por proceso. Para que le llegue al juego, tocá 'Timer global' en la página Pro y reiniciá." 'warn'
+    } else {
+        Write-Log 'Ojo: en Windows 10 (2004 en adelante) el timer es por proceso y no le llega al juego. Queda prendido, pero no esperes diferencia.' 'warn'
+    }
+}
+
+function Enable-TimerGlobal {
+    # Windows 11: vuelve global el pedido de timer (como era antes de 2004).
+    # Tweak persistente de registro, con backup en el mismo archivo que el resto.
+    if (-not $script:EsWin11) {
+        Write-Log 'El timer global solo existe en Windows 11. En Windows 10 no hay forma de que el timer de Booster le llegue al juego.' 'warn'
+        return
+    }
+    $tweaks = $null
+    if (Test-Path $TweaksPath) {
+        try { $tweaks = Get-Content $TweaksPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+    }
+    if (-not $tweaks) { $tweaks = [pscustomobject]@{} }
+    if ($tweaks.PSObject.Properties.Name -contains 'timerGlobal') {
+        Write-Log "El timer global ya estaba activado por Booster ('Revertir tweaks' lo deshace)." 'info'
+        return
+    }
+    $previo = Get-RegValueOrNull $TimerGlobalKey 'GlobalTimerResolutionRequests'
+    try {
+        Set-ItemProperty -Path $TimerGlobalKey -Name 'GlobalTimerResolutionRequests' -Value 1 -Type DWord -ErrorAction Stop
+    } catch {
+        Write-Log "No se pudo escribir la clave del timer global: $($_.Exception.Message)" 'err'
+        return
+    }
+    $tweaks | Add-Member -NotePropertyName timerGlobal -NotePropertyValue ([pscustomobject]@{ previo = $previo })
+    ConvertTo-Json -InputObject $tweaks -Depth 6 | Set-Content $TweaksPath -Encoding UTF8
+    Write-Log "Timer global activado. REINICIÁ la PC para que tome efecto; después prendé el toggle 'Timer 0,5 ms'." 'ok'
+}
+
+# --- Afinidad a núcleos P (CPUs híbridas) -----------------------
+$script:CpuTopo    = [BoosterCpu]::Query()      # [mascaraP, mascaraTodos, nucleosP, nucleosE]
+$script:CpuHibrido = ($script:CpuTopo[0] -ne 0)
+
+function Get-GameProcesses {
+    @(Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-InList $_.Name $Config.juegos })
+}
+
+function Set-GameAffinity($proc, [bool]$soloP) {
+    # Fija el juego a los núcleos P (o lo devuelve a todos). Muere con el
+    # proceso del juego: no deja nada cambiado en Windows.
+    if (-not $script:CpuHibrido) { return }
+    $mask = if ($soloP) { $script:CpuTopo[0] } else { $script:CpuTopo[1] }
+    try {
+        if ([long]$proc.ProcessorAffinity -eq $mask) { return }
+        $proc.ProcessorAffinity = [IntPtr]$mask
+        if ($soloP) {
+            Write-Log "Solo P-cores: $($proc.Name) fijado a los $($script:CpuTopo[2]) núcleos de rendimiento." 'ok'
+        } else {
+            Write-Log "$($proc.Name) vuelve a usar todos los núcleos." 'info'
+        }
+    } catch {
+        Write-Log "No se pudo cambiar la afinidad de $($proc.Name) (algunos anticheat lo bloquean, no pasa nada)." 'warn'
+    }
+}
+
+function Test-QuierePCores([string]$nombreJuego) {
+    if ($chkPCores.Checked) { return $true }
+    $perfil = @($Config.perfiles) | Where-Object { $_ -and $nombreJuego -like $_.juego } | Select-Object -First 1
+    return [bool]($perfil -and $perfil.PSObject.Properties.Name -contains 'soloPCores' -and $perfil.soloPCores)
 }
 
 # --- Purga de memoria standby (estilo ISLC) --------------------
@@ -814,7 +1091,7 @@ function Show-KillPicker($items) {
     $dlg.ForeColor       = $colText
 
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text     = "Apps abiertas y procesos de fondo detectados.`nDestildá lo que quieras dejar corriendo:"
+    $lbl.Text     = "Tus apps vienen tildadas; lo de 'Fondo' viene destildado: tildá solo`nlo que quieras cerrar. Los servers blindados ni aparecen."
     $lbl.Location = New-Object System.Drawing.Point(15, 12)
     $lbl.Size     = New-Object System.Drawing.Size(455, 36)
     $dlg.Controls.Add($lbl)
@@ -835,7 +1112,9 @@ function Show-KillPicker($items) {
         $item = New-Object System.Windows.Forms.ListViewItem($it.Name)
         [void]$item.SubItems.Add([string]$it.RamMB)
         [void]$item.SubItems.Add($it.Tipo)
-        $item.Checked = $true
+        # Las apps de tu lista vienen tildadas; lo que encontró el barrido
+        # de fondo viene DESTILDADO: se cierra solo si lo elegís vos.
+        $item.Checked = ($it.Tipo -ne 'Fondo')
         if ($it.Tipo -eq 'Fondo') { $item.ForeColor = $colDim }
         [void]$lv.Items.Add($item)
     }
@@ -873,13 +1152,16 @@ function Show-KillPicker($items) {
 function Set-GamePriority {
     # Prioridad de CPU ALTA para los juegos corriendo: lo mismo que harías
     # a mano en el Administrador de tareas. Muere con el proceso del juego.
-    foreach ($p in (Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-InList $_.Name $Config.juegos })) {
+    foreach ($p in (Get-GameProcesses)) {
         try {
-            $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
-            Write-Log "Prioridad de CPU ALTA para $($p.Name) (PID $($p.Id))." 'ok'
+            if ($p.PriorityClass -ne [System.Diagnostics.ProcessPriorityClass]::High) {
+                $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::High
+                Write-Log "Prioridad de CPU ALTA para $($p.Name) (PID $($p.Id))." 'ok'
+            }
         } catch {
             Write-Log "No se pudo subir la prioridad de $($p.Name) (algunos anticheat lo bloquean, no pasa nada)." 'warn'
         }
+        if (Test-QuierePCores $p.Name) { Set-GameAffinity $p $true }
     }
 }
 
@@ -937,13 +1219,15 @@ function Invoke-GamingMode([switch]$Silencioso, [string[]]$Conservar = @()) {
     # 1) Cierre automático de la lista segura (con comodines).
     #    El perfil del juego puede pedir conservar algunas apps.
     $auto = @(Get-RunningMatches $Config.cerrarSiempre)
+    $aCerrar = @()
     foreach ($g in $auto) {
         if (Test-InList $g.Name $Conservar) {
             Write-Log "Conservado por perfil del juego: $($g.Name)" 'info'
             continue
         }
-        Close-ProcessByName $g.Name
+        $aCerrar += $g.Name
     }
+    Close-ProcessesByName $aCerrar
     if ($auto.Count -eq 0) { Write-Log 'Nada que cerrar de la lista automática.' 'info' }
 
     # 2) Modo mixto: apps conocidas + barrido de procesos de fondo.
@@ -955,7 +1239,7 @@ function Invoke-GamingMode([switch]$Silencioso, [string[]]$Conservar = @()) {
         $items = @($ask + $fondo | Sort-Object RamMB -Descending)
         if ($items.Count -gt 0) {
             $elegidos = Show-KillPicker $items
-            foreach ($name in $elegidos) { Close-ProcessByName $name }
+            Close-ProcessesByName @($elegidos)
         }
     }
 
@@ -979,15 +1263,15 @@ function Invoke-GamingMode([switch]$Silencioso, [string[]]$Conservar = @()) {
         Write-Log "Tip: tocá 'Optimizar PC' para los tweaks persistentes (red, GameDVR, ahorro de energía). Se hace una sola vez." 'info'
     }
 
-    # 6) Plan de energía Alto rendimiento y timer de 0.5 ms
+    # 6) Plan de energía Alto rendimiento
     Enable-HighPerformance
-    if (-not $chkTimer.Checked) { $chkTimer.Checked = $true }
 
     # 7) Purgar la memoria standby (los procesos recién cerrados dejan caché)
     Start-Sleep -Milliseconds 1500
     Clear-StandbyMemory
 
-    # 8) Si ya hay un juego corriendo, prioridad de CPU alta para él
+    # 8) Si ya hay un juego corriendo: prioridad de CPU alta y, si está
+    #    pedido (toggle o perfil), afinidad a los núcleos P
     Set-GamePriority
 
     $ramDespues = Get-FreeRamMB
@@ -1009,16 +1293,110 @@ $form.MaximizeBox     = $false
 $form.BackColor       = $colBg
 $form.Font            = New-Object System.Drawing.Font('Segoe UI', 9.5)
 
-function Set-Rounded($ctl, [int]$r) {
-    # Esquinas redondeadas via Region (GraphicsPath de 4 arcos)
-    $d = $r * 2
+# --- Motor visual ----------------------------------------------------
+# Todo lo redondeado se PINTA con antialiasing (antes se recortaba con
+# Region y los bordes quedaban serruchados). Los botones tienen estado
+# hover/presionado y los toggles son interruptores de verdad.
+$script:sfCenter = New-Object System.Drawing.StringFormat
+$script:sfCenter.Alignment     = 'Center'
+$script:sfCenter.LineAlignment = 'Center'
+$script:sfLeft = New-Object System.Drawing.StringFormat
+$script:sfLeft.LineAlignment = 'Center'
+$script:sfLeft.FormatFlags   = 'NoWrap'
+$script:sfLeft.Trimming      = 'EllipsisCharacter'
+$script:uiFontHead = New-Object System.Drawing.Font('Segoe UI Semibold', 8)
+$script:uiBrHead   = New-Object System.Drawing.SolidBrush($colBg)
+$script:uiBrDim    = New-Object System.Drawing.SolidBrush($colDim)
+$script:uiPenLine  = New-Object System.Drawing.Pen($colSurface, 1)
+
+function New-RoundPath([single]$x, [single]$y, [single]$w, [single]$h, [single]$r) {
+    $d = [Math]::Min($r * 2, [Math]::Min($w, $h))
     $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $gp.AddArc(0, 0, $d, $d, 180, 90)
-    $gp.AddArc($ctl.Width - $d - 1, 0, $d, $d, 270, 90)
-    $gp.AddArc($ctl.Width - $d - 1, $ctl.Height - $d - 1, $d, $d, 0, 90)
-    $gp.AddArc(0, $ctl.Height - $d - 1, $d, $d, 90, 90)
+    $gp.AddArc($x, $y, $d, $d, 180, 90)
+    $gp.AddArc($x + $w - $d, $y, $d, $d, 270, 90)
+    $gp.AddArc($x + $w - $d, $y + $h - $d, $d, $d, 0, 90)
+    $gp.AddArc($x, $y + $h - $d, $d, $d, 90, 90)
     $gp.CloseFigure()
-    $ctl.Region = New-Object System.Drawing.Region($gp)
+    return $gp
+}
+
+function Get-Shade($c, [double]$k) {
+    # k > 0 aclara hacia blanco; k < 0 oscurece hacia negro
+    $t = if ($k -ge 0) { 255 } else { 0 }
+    $a = [Math]::Abs($k)
+    [System.Drawing.Color]::FromArgb(
+        [int]($c.R + ($t - $c.R) * $a), [int]($c.G + ($t - $c.G) * $a), [int]($c.B + ($t - $c.B) * $a))
+}
+
+function Set-Rounded($ctl, [int]$r) {
+    # Panel/tarjeta con fondo redondeado pintado. Se llama ANTES de agregar
+    # otros Paint, así el fondo queda debajo de lo que dibuje el control.
+    $ctl.Tag = @{ Radius = $r; Fill = $ctl.BackColor }
+    $ctl.BackColor = $colBg
+    $ctl.Add_Paint({
+        param($s, $e)
+        try {
+            $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $gp = New-RoundPath 0 0 ($s.Width - 1) ($s.Height - 1) $s.Tag.Radius
+            $br = New-Object System.Drawing.SolidBrush($s.Tag.Fill)
+            $e.Graphics.FillPath($br, $gp)
+            $br.Dispose(); $gp.Dispose()
+        } catch {}
+    })
+}
+
+function Invoke-PaintControl($s, $g) {
+    # Pinta un botón o un toggle entero: fondo del padre, pastilla redondeada
+    # con hover/presionado, y el texto. En los toggles, además, el interruptor.
+    try {
+        $g.SmoothingMode     = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+        $g.Clear($(if ($s.Parent) { $s.Parent.BackColor } else { $colBg }))
+        $esToggle = $s -is [System.Windows.Forms.CheckBox]
+        $on   = $esToggle -and $s.Checked
+        $fill = if ($esToggle) { if ($on) { Get-Shade $colAccent -0.72 } else { $colPanel } } else { $s.BackColor }
+        if ($s.Tag.Down) { $fill = Get-Shade $fill -0.14 } elseif ($s.Tag.Hover) { $fill = Get-Shade $fill 0.09 }
+
+        $gp = New-RoundPath 0 0 ($s.Width - 1) ($s.Height - 1) $s.Tag.Radius
+        if ($s.Tag.Gradient) {
+            $rect = New-Object System.Drawing.RectangleF(0, 0, $s.Width, $s.Height)
+            $br = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, $fill, (Get-Shade $colBlue $(if ($s.Tag.Hover) { 0.09 } else { 0 })), 0.0)
+        } else {
+            $br = New-Object System.Drawing.SolidBrush($fill)
+        }
+        $g.FillPath($br, $gp)
+        $br.Dispose()
+
+        if ($esToggle) {
+            # Borde fino + interruptor a la izquierda
+            $pen = New-Object System.Drawing.Pen($(if ($on) { $colAccent } else { $colSurface }), 1.2)
+            $g.DrawPath($pen, $gp); $pen.Dispose()
+            $swW = 30; $swH = 16; $sx = 12; $sy = [int](($s.Height - $swH) / 2)
+            $sp = New-RoundPath $sx $sy $swW $swH 8
+            $sb = New-Object System.Drawing.SolidBrush($(if ($on) { $colAccent } else { $colSurface }))
+            $g.FillPath($sb, $sp); $sb.Dispose(); $sp.Dispose()
+            $kx = if ($on) { $sx + $swW - $swH + 2 } else { $sx + 2 }
+            $kb = New-Object System.Drawing.SolidBrush($(if ($on) { $colDark } else { $colDim }))
+            $g.FillEllipse($kb, $kx, ($sy + 2), ($swH - 4), ($swH - 4)); $kb.Dispose()
+            $tb = New-Object System.Drawing.SolidBrush($(if ($on) { $colText } else { $colDim }))
+            $tr = New-Object System.Drawing.RectangleF(($sx + $swW + 8), 0, ($s.Width - $sx - $swW - 14), $s.Height)
+            $g.DrawString($s.Text, $s.Font, $tb, $tr, $script:sfLeft); $tb.Dispose()
+        } else {
+            $tb = New-Object System.Drawing.SolidBrush($s.ForeColor)
+            $tr = New-Object System.Drawing.RectangleF(0, 0, $s.Width, $s.Height)
+            $g.DrawString($s.Text, $s.Font, $tb, $tr, $script:sfCenter); $tb.Dispose()
+        }
+        $gp.Dispose()
+    } catch {}
+}
+
+function Add-ControlPaint($c, [int]$r) {
+    $c.Tag = @{ Radius = $r; Hover = $false; Down = $false; Gradient = $false }
+    $c.Add_MouseEnter({ $this.Tag.Hover = $true;  $this.Invalidate() })
+    $c.Add_MouseLeave({ $this.Tag.Hover = $false; $this.Tag.Down = $false; $this.Invalidate() })
+    $c.Add_MouseDown({  $this.Tag.Down  = $true;  $this.Invalidate() })
+    $c.Add_MouseUp({    $this.Tag.Down  = $false; $this.Invalidate() })
+    $c.Add_Paint({ param($s, $e) Invoke-PaintControl $s $e.Graphics })
 }
 
 function New-Btn([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $bg, $fg, $parent) {
@@ -1033,31 +1411,110 @@ function New-Btn([string]$text, [int]$x, [int]$y, [int]$w, [int]$h, $bg, $fg, $p
     $b.FlatAppearance.BorderSize = 0
     $b.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5)
     $b.Cursor    = 'Hand'
-    Set-Rounded $b 8
+    $b.TabStop   = $false
+    Add-ControlPaint $b 9
     $parent.Controls.Add($b)
     return $b
 }
 
 function New-Toggle([string]$text, [int]$x, [int]$y, [int]$w, $parent) {
-    # Checkbox con pinta de pill: gris apagado, mauve encendido
+    # Interruptor: apagado gris, encendido mauve con la perilla a la derecha
     if (-not $parent) { $parent = $form }
     $t = New-Object System.Windows.Forms.CheckBox
     $t.Appearance = 'Button'
     $t.Text       = $text
     $t.Location   = New-Object System.Drawing.Point($x, $y)
     $t.Size       = New-Object System.Drawing.Size($w, 36)
-    $t.TextAlign  = 'MiddleCenter'
     $t.FlatStyle  = 'Flat'
     $t.FlatAppearance.BorderSize = 0
-    $t.FlatAppearance.CheckedBackColor = $colAccent
-    $t.BackColor  = $colSurface
+    $t.BackColor  = $colPanel
     $t.ForeColor  = $colText
     $t.Cursor     = 'Hand'
-    $t.Add_CheckedChanged({ $this.ForeColor = if ($this.Checked) { $colDark } else { $colText } })
-    Set-Rounded $t 18
+    $t.TabStop    = $false
+    Add-ControlPaint $t 18
+    $t.Add_CheckedChanged({ $this.Invalidate() })
     $parent.Controls.Add($t)
     return $t
 }
+
+# Ventana, listas y barras de scroll en oscuro (APIs de tema de Windows)
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class BoosterUi {
+    [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)]
+    static extern int SetWindowTheme(IntPtr h, string app, string id);
+    [DllImport("uxtheme.dll", EntryPoint = "#135")]
+    static extern int SetPreferredAppMode(int mode);
+    [DllImport("dwmapi.dll")]
+    static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int v, int size);
+    [DllImport("user32.dll")]
+    static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+
+    public static void AllowDark() { try { SetPreferredAppMode(1); } catch { } }
+    public static void DarkTitle(IntPtr h) {
+        try { int v = 1; if (DwmSetWindowAttribute(h, 20, ref v, 4) != 0) DwmSetWindowAttribute(h, 19, ref v, 4); } catch { }
+    }
+    public static void DarkScroll(IntPtr h) { try { SetWindowTheme(h, "DarkMode_Explorer", null); } catch { } }
+    public static void DarkList(IntPtr h) {
+        try {
+            SetWindowTheme(h, "DarkMode_Explorer", null);
+            IntPtr hdr = SendMessage(h, 0x101F, IntPtr.Zero, IntPtr.Zero);   // LVM_GETHEADER
+            if (hdr != IntPtr.Zero) SetWindowTheme(hdr, "DarkMode_ItemsView", null);
+        } catch { }
+    }
+}
+"@
+[BoosterUi]::AllowDark()
+
+# Filas más altas en las listas (truco: un ImageList de 1 px de ancho)
+$script:RowImgs = New-Object System.Windows.Forms.ImageList
+$script:RowImgs.ImageSize = New-Object System.Drawing.Size(1, 26)
+
+function Set-DarkList($lv) {
+    # Encabezado pintado en oscuro, filas con aire y scroll oscuro
+    $lv.OwnerDraw      = $true
+    $lv.SmallImageList = $script:RowImgs
+    # La última columna ocupa lo que sobra: sin esto queda un bloque de
+    # encabezado vacío de otro color a la derecha
+    if ($lv.Columns.Count -gt 0) {
+        $usado = 0
+        for ($i = 0; $i -lt $lv.Columns.Count - 1; $i++) { $usado += $lv.Columns[$i].Width }
+        $resto = $lv.Width - $usado - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth - 2
+        if ($resto -gt 40) { $lv.Columns[$lv.Columns.Count - 1].Width = $resto }
+    }
+    $lv.Add_DrawColumnHeader({
+        param($s, $e)
+        $e.Graphics.FillRectangle($script:uiBrHead, $e.Bounds)
+        $r = New-Object System.Drawing.RectangleF(($e.Bounds.X + 8), $e.Bounds.Y, ($e.Bounds.Width - 10), $e.Bounds.Height)
+        $e.Graphics.DrawString($e.Header.Text.ToUpper(), $script:uiFontHead, $script:uiBrDim, $r, $script:sfLeft)
+    })
+    $lv.Add_DrawItem({ param($s, $e) $e.DrawDefault = $true })
+    $lv.Add_DrawSubItem({ param($s, $e) $e.DrawDefault = $true })
+    $lv.Add_HandleCreated({ [BoosterUi]::DarkList($this.Handle) })
+}
+
+function New-BoosterIcon {
+    # Ícono propio (rayo sobre degradé mauve-azul) para la ventana y la bandeja
+    $bmp = New-Object System.Drawing.Bitmap(64, 64)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $gp = New-RoundPath 2 2 60 60 15
+    $br = New-Object System.Drawing.Drawing2D.LinearGradientBrush((New-Object System.Drawing.Rectangle(0, 0, 64, 64)), $colAccent, $colBlue, 45.0)
+    $g.FillPath($br, $gp)
+    $pts = [System.Drawing.PointF[]]@(
+        (New-Object System.Drawing.PointF(37, 7)),  (New-Object System.Drawing.PointF(15, 36)),
+        (New-Object System.Drawing.PointF(29, 36)), (New-Object System.Drawing.PointF(25, 57)),
+        (New-Object System.Drawing.PointF(49, 26)), (New-Object System.Drawing.PointF(35, 26)))
+    $bb = New-Object System.Drawing.SolidBrush($colBg)
+    $g.FillPolygon($bb, $pts)
+    $bb.Dispose(); $br.Dispose(); $gp.Dispose(); $g.Dispose()
+    return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+}
+$script:BoosterIcon = New-BoosterIcon
+$form.Icon = $script:BoosterIcon
+$form.Text = 'Booster'
+$form.Add_HandleCreated({ [BoosterUi]::DarkTitle($form.Handle) })
 
 function Set-AllChecks($lv) {
     # Autoseleccionador: tilda todo; si ya estaba todo tildado, destilda todo
@@ -1083,13 +1540,46 @@ $lblSub.Location  = New-Object System.Drawing.Point(28, 52)
 $lblSub.AutoSize  = $true
 $form.Controls.Add($lblSub)
 
-$chkTimer = New-Toggle 'Timer 0,5 ms' 668 20 138
+# Chip de versión al lado del título y línea fina que separa la cabecera
+$lblVer = New-Object System.Windows.Forms.Label
+$lblVer.Text      = "v$($script:BoosterVersion)"
+$lblVer.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+$lblVer.ForeColor = $colAccent
+$lblVer.BackColor = $colPanel
+$lblVer.TextAlign = 'MiddleCenter'
+$lblVer.Location  = New-Object System.Drawing.Point(192, 22)
+$lblVer.Size      = New-Object System.Drawing.Size(34, 20)
+$form.Controls.Add($lblVer)
+
+$sepHeader = New-Object System.Windows.Forms.Panel
+$sepHeader.Location  = New-Object System.Drawing.Point(24, 74)
+$sepHeader.Size      = New-Object System.Drawing.Size(1116, 1)
+$sepHeader.BackColor = $colPanel
+$form.Controls.Add($sepHeader)
+
+$chkTimer = New-Toggle 'Timer 0,5 ms' 490 20 150
 $chkTimer.Add_CheckedChanged({ Set-TimerResolution $chkTimer.Checked })
 
-$chkAuto = New-Toggle 'Auto-gaming' 816 20 138
+$chkPCores = New-Toggle 'Solo P-cores' 648 20 150
+$chkPCores.Visible = $script:CpuHibrido
+$chkPCores.Add_CheckedChanged({
+    # Se aplica en el acto a los juegos que ya estén corriendo: prendelo y
+    # apagalo con el juego abierto y mirá los FPS para saber si te sirve.
+    $juegos = Get-GameProcesses
+    foreach ($p in $juegos) { Set-GameAffinity $p $chkPCores.Checked }
+    if ($chkPCores.Checked) {
+        Write-Log ("Solo P-cores ON: los juegos se fijan a los {0} núcleos de rendimiento (los {1} E quedan para lo demás)." -f $script:CpuTopo[2], $script:CpuTopo[3]) 'info'
+        if ($juegos.Count -eq 0) { Write-Log 'No hay un juego abierto ahora: se aplica cuando lo detecte.' 'info' }
+    } else {
+        Write-Log 'Solo P-cores desactivado.' 'info'
+    }
+})
+
+$chkAuto = New-Toggle 'Auto-gaming' 806 20 150
 $chkAuto.Add_CheckedChanged({
     if ($chkAuto.Checked) {
         Write-Log "Auto-gaming ON: al detectar un juego (lista 'juegos' del config) se activa el modo gaming solo, sin diálogos." 'info'
+        if ($script:Sigilo) { Write-Log 'Ya hay un juego abierto: tocá MODO GAMING si querés aplicarlo ahora.' 'info' }
     } else {
         Write-Log 'Auto-gaming desactivado.' 'info'
     }
@@ -1097,17 +1587,21 @@ $chkAuto.Add_CheckedChanged({
 
 $btnGaming = New-Btn 'MODO GAMING' 966 14 174 48 $colAccent $colDark $form
 $btnGaming.Font = New-Object System.Drawing.Font('Segoe UI', 11.5, [System.Drawing.FontStyle]::Bold)
+$btnGaming.Tag.Gradient = $true
+$btnGaming.Tag.Radius   = 12
 $btnGaming.Add_Click({ Invoke-GamingMode })
 
 # ----- Navegación de páginas -----
 $btnNavLimpieza = New-Btn 'Limpieza' 24 84 130 34 $colSurface $colText $form
 $btnNavRecursos = New-Btn 'Recursos' 162 84 130 34 $colSurface $colText $form
 $btnNavPro      = New-Btn 'Pro'      300 84 130 34 $colSurface $colText $form
+$btnNavDiag     = New-Btn 'Diagnóstico' 438 84 130 34 $colSurface $colText $form
 
 $pageLimpieza = New-Object System.Windows.Forms.Panel
 $pageRecursos = New-Object System.Windows.Forms.Panel
 $pagePro      = New-Object System.Windows.Forms.Panel
-foreach ($pg in @($pageLimpieza, $pageRecursos, $pagePro)) {
+$pageDiag     = New-Object System.Windows.Forms.Panel
+foreach ($pg in @($pageLimpieza, $pageRecursos, $pagePro, $pageDiag)) {
     $pg.Location  = New-Object System.Drawing.Point(24, 130)
     $pg.Size      = New-Object System.Drawing.Size(1116, 540)
     $pg.BackColor = $colBg
@@ -1119,7 +1613,8 @@ function Show-Page([string]$name) {
     $pageLimpieza.Visible = ($name -eq 'limpieza')
     $pageRecursos.Visible = ($name -eq 'recursos')
     $pagePro.Visible      = ($name -eq 'pro')
-    foreach ($par in @(@($btnNavLimpieza, 'limpieza'), @($btnNavRecursos, 'recursos'), @($btnNavPro, 'pro'))) {
+    $pageDiag.Visible     = ($name -eq 'diag')
+    foreach ($par in @(@($btnNavLimpieza, 'limpieza'), @($btnNavRecursos, 'recursos'), @($btnNavPro, 'pro'), @($btnNavDiag, 'diag'))) {
         $activo = ($par[1] -eq $name)
         $par[0].BackColor = if ($activo) { $colAccent } else { $colSurface }
         $par[0].ForeColor = if ($activo) { $colDark } else { $colText }
@@ -1128,6 +1623,7 @@ function Show-Page([string]$name) {
 $btnNavLimpieza.Add_Click({ Show-Page 'limpieza' })
 $btnNavRecursos.Add_Click({ Show-Page 'recursos' })
 $btnNavPro.Add_Click({ Show-Page 'pro' })
+$btnNavDiag.Add_Click({ Show-Page 'diag' })
 
 # ================= PÁGINA LIMPIEZA =================
 $lblProc = New-Object System.Windows.Forms.Label
@@ -1152,6 +1648,7 @@ $lvProc.BorderStyle   = 'None'
 [void]$lvProc.Columns.Add('RAM (MB)', 105)
 [void]$lvProc.Columns.Add('CPU (%)', 80)
 [void]$lvProc.Columns.Add('Fondo', 65)
+Set-DarkList $lvProc
 $pageLimpieza.Controls.Add($lvProc)
 
 function Refresh-ProcessList {
@@ -1162,8 +1659,9 @@ function Refresh-ProcessList {
         [void]$item.SubItems.Add([string]$g.Count)
         [void]$item.SubItems.Add(([Math]::Round($g.RamMB)).ToString('N0'))
         [void]$item.SubItems.Add([string]$g.CpuPct)
-        [void]$item.SubItems.Add($(if ($g.TieneVentana) { '' } else { 'Sí' }))
-        if ($g.CpuPct -ge 15 -or $g.RamMB -ge 800) { $item.ForeColor = $colRed }
+        [void]$item.SubItems.Add($(if ($g.EsServidor) { 'SERVER' } elseif ($g.TieneVentana) { '' } else { 'Sí' }))
+        if ($g.EsServidor) { $item.ForeColor = $colBlue }
+        elseif ($g.CpuPct -ge 15 -or $g.RamMB -ge 800) { $item.ForeColor = $colRed }
         [void]$lvProc.Items.Add($item)
     }
     $form.Cursor = 'Default'
@@ -1189,6 +1687,7 @@ $lvSvc.BorderStyle   = 'None'
 [void]$lvSvc.Columns.Add('Servicio', 225)
 [void]$lvSvc.Columns.Add('Estado', 95)
 [void]$lvSvc.Columns.Add('Origen', 85)
+Set-DarkList $lvSvc
 $pageLimpieza.Controls.Add($lvSvc)
 
 function Refresh-ServiceList {
@@ -1235,7 +1734,7 @@ $btnKill.Add_Click({
         Write-Log 'No hay procesos tildados.' 'warn'
         return
     }
-    foreach ($name in $marcados) { Close-ProcessByName $name }
+    Close-ProcessesByName $marcados
     Refresh-ProcessList
 })
 
@@ -1266,7 +1765,10 @@ $script:TickNum          = 0
 $script:HistCap          = 180      # 3 minutos de historia a 1 muestra/seg
 $script:PurgadoSesionMB  = 0
 $script:TotalRamMB       = ([BoosterRam]::Query())[0]
-$script:JuegoDetectado   = $false
+$script:Sigilo           = $false
+$script:JuegoPids        = @()
+$script:WatchOk          = $false
+$script:PingTask         = $null
 $script:BoostEnCurso     = $false
 $script:PingHist         = New-Object System.Collections.ArrayList
 $script:Pinger           = New-Object System.Net.NetworkInformation.Ping
@@ -1325,7 +1827,8 @@ $chartPanel.Add_Paint({
             $g.DrawString($txt, $cFontBig, $cBrAccent, $W - 18 - $szB.Width, 8)
             $sub = ('en uso de {0:N0} GB' -f ($script:TotalRamMB / 1024))
             $szS = $g.MeasureString($sub, $cFontTiny)
-            $g.DrawString($sub, $cFontTiny, $cBrDim, $W - 18 - $szS.Width, 8 + $szB.Height - 5)
+            # El subtítulo va a la izquierda del valor (abajo pisaba las etiquetas del eje)
+            $g.DrawString($sub, $cFontTiny, $cBrDim, ($W - 18 - $szB.Width - $szS.Width - 6), (8 + $szB.Height - $szS.Height - 7))
         }
         if ($hist.Count -lt 2) {
             $g.DrawString('Recolectando datos...', $cFontCap, $cBrDim, $padL, $padT + $plotH / 2)
@@ -1406,10 +1909,10 @@ $pingPanel.Add_Paint({
         $g = $e.Graphics
         $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $W = $sender.ClientSize.Width; $H = $sender.ClientSize.Height
-        $padL = 18; $padR = 84; $padT = 32; $padB = 12
+        $padL = 18; $padR = 84; $padT = 46; $padB = 12
         $plotW = $W - $padL - $padR; $plotH = $H - $padT - $padB
 
-        $g.DrawString('PING EN VIVO - 1.1.1.1', $cFontCap, $cBrDim, 18, 9)
+        $g.DrawString($(if ($script:Sigilo) { 'PING - en pausa (modo sigilo)' } else { 'PING EN VIVO - 1.1.1.1' }), $cFontCap, $cBrDim, 18, 9)
 
         $hist = @($script:PingHist)
         if ($hist.Count -ge 1) {
@@ -1425,7 +1928,7 @@ $pingPanel.Add_Paint({
                 $j = [Math]::Round($j / ($ult.Count - 1), 1)
                 $sub = "jitter $j ms"
                 $szS = $g.MeasureString($sub, $cFontTiny)
-                $g.DrawString($sub, $cFontTiny, $cBrDim, ($W - 18 - $szS.Width), (5 + $sz.Height - 5))
+                $g.DrawString($sub, $cFontTiny, $cBrDim, ($W - 18 - $sz.Width - $szS.Width - 6), (5 + $sz.Height - $szS.Height - 7))
             }
         }
         if ($hist.Count -lt 2) {
@@ -1470,6 +1973,7 @@ function New-Card([string]$caption, [int]$x, $valColor) {
     $cap.Text      = $caption
     $cap.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.25)
     $cap.ForeColor = $colDim
+    $cap.BackColor = $colPanel
     $cap.Location  = New-Object System.Drawing.Point(14, 9)
     $cap.AutoSize  = $true
     $p.Controls.Add($cap)
@@ -1477,6 +1981,7 @@ function New-Card([string]$caption, [int]$x, $valColor) {
     $val.Text      = '—'
     $val.Font      = New-Object System.Drawing.Font('Segoe UI', 13.5, [System.Drawing.FontStyle]::Bold)
     $val.ForeColor = $valColor
+    $val.BackColor = $colPanel
     $val.Location  = New-Object System.Drawing.Point(12, 27)
     $val.AutoSize  = $true
     $p.Controls.Add($val)
@@ -1494,7 +1999,7 @@ $btnPurge = New-Btn 'Purgar RAM caché' 0 456 220 46 $colTeal $colDark $pageRecu
 $btnPurge.Font = New-Object System.Drawing.Font('Segoe UI', 10.5, [System.Drawing.FontStyle]::Bold)
 $btnPurge.Add_Click({ Clear-StandbyMemory })
 
-$chkAutoPurga = New-Toggle 'Auto-purga' 232 461 130 $pageRecursos
+$chkAutoPurga = New-Toggle 'Auto-purga' 232 461 140 $pageRecursos
 $chkAutoPurga.Add_CheckedChanged({
     if ($chkAutoPurga.Checked) {
         Write-Log ("Auto-purga ON: si la RAM libre baja de {0:N0} MB purgo solo (máximo una vez cada 2 minutos)." -f $Config.autoPurgaLibreMB) 'info'
@@ -1504,7 +2009,7 @@ $chkAutoPurga.Add_CheckedChanged({
 })
 
 $lblPurgeHint = New-Object System.Windows.Forms.Label
-$lblPurgeHint.Text      = "Purga manual o automática: la caché standby se convierte en RAM libre (estilo ISLC) y cada purga queda`nmarcada en verde en el gráfico. El umbral de la auto-purga es 'autoPurgaLibreMB' del config.json."
+$lblPurgeHint.Text      = "La caché standby se convierte en RAM libre (estilo ISLC); cada purga queda marcada en verde. La auto-purga viene apagada:`ncon RAM de sobra no suma, y purgar en plena partida obliga a releer del disco. Umbral: 'autoPurgaLibreMB' del config.json."
 $lblPurgeHint.ForeColor = $colDim
 $lblPurgeHint.Location  = New-Object System.Drawing.Point(378, 458)
 $lblPurgeHint.Size      = New-Object System.Drawing.Size(738, 42)
@@ -1530,7 +2035,7 @@ $lblPro.Location  = New-Object System.Drawing.Point(0, 0)
 $lblPro.AutoSize  = $true
 $pagePro.Controls.Add($lblPro)
 
-$btnNetOpt = New-ProRow 'Optimizar PC' 30 $colAccent $colDark "Tweaks persistentes (una sola vez): red sin Nagle ni throttling, GameDVR apagado y ahorro de energía de placa de red/USB desactivado. Guarda backup de cada valor original."
+$btnNetOpt = New-ProRow 'Optimizar PC' 30 $colAccent $colDark "Tweaks persistentes (una sola vez): GameDVR apagado, ahorro de energía de placa de red/USB desactivado y red sin throttling ni Nagle (Nagle solo afecta a juegos por TCP; los que van por UDP, como Valorant o CS2, no lo notan). Con backup."
 $btnNetOpt.Add_Click({ Optimize-System })
 
 $btnNetUndo = New-ProRow 'Revertir tweaks' 96 $colSurface $colText "Deshace todo lo de Optimizar PC restaurando los valores exactos que tenía tu PC, desde los backups."
@@ -1542,7 +2047,7 @@ $btnPing.Add_Click({ Test-PingLatency })
 $btnStartup = New-ProRow 'Apps de inicio' 228 $colSurface $colText "Elegí qué programas arrancan junto con Windows. Usa la misma mecánica que el Administrador de tareas: no borra nada y es 100% reversible."
 $btnStartup.Add_Click({ Show-StartupManager })
 
-$btnWork = New-ProRow 'Modo trabajo' 294 $colGreen $colDark "El botón inverso: restaura servicios y plan de energía, apaga timer y auto-gaming, y te abre las apps de la lista 'abrirEnTrabajo' del config.json. El lunes empieza con un click."
+$btnWork = New-ProRow 'Modo trabajo' 294 $colGreen $colDark "El botón inverso: restaura servicios y plan de energía, apaga el auto-gaming y te abre las apps de la lista 'abrirEnTrabajo' del config.json. El lunes empieza con un click."
 $btnWork.Add_Click({ Invoke-WorkMode })
 
 $btnJunk = New-ProRow 'Limpiar basura' 360 $colYellow $colDark "Borra temporales de Windows y cachés de shaders viejos (DirectX/NVIDIA). Los shaders se regeneran solos: la primera carga del juego puede tardar un toque más, y de paso cura stutters por caché corrupta."
@@ -1559,6 +2064,317 @@ $btnRescate.Add_Click({
     Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$rescate`""
 })
 
+# ================= PÁGINA DIAGNÓSTICO =================
+# Dos cosas: (1) auditar los ajustes que de verdad mueven la aguja (Hz del
+# monitor, XMP, plan de energía, etc.) y (2) MEDIR el ruido de fondo de la
+# PC antes y después, para que cada tweak se justifique con números.
+# Todo es de solo lectura: acá no se cambia nada.
+function Get-Diagnostico {
+    $r = New-Object System.Collections.ArrayList
+    function Add-Chequeo($chequeo, $estado, $detalle) {
+        [void]$r.Add([pscustomobject]@{ Chequeo = $chequeo; Estado = $estado; Detalle = $detalle })
+    }
+
+    # Monitor: ¿está corriendo a los Hz que da?
+    try {
+        foreach ($v in @(Get-CimInstance Win32_VideoController -ErrorAction Stop | Where-Object { $_.CurrentRefreshRate })) {
+            $res = "$($v.CurrentHorizontalResolution)x$($v.CurrentVerticalResolution) a $($v.CurrentRefreshRate) Hz"
+            if ($v.MaxRefreshRate -and $v.CurrentRefreshRate -lt ($v.MaxRefreshRate - 1)) {
+                Add-Chequeo 'Monitor' 'REVISAR' "$res, pero según Windows da hasta $($v.MaxRefreshRate) Hz. Subilo en Configuración > Pantalla > Pantalla avanzada."
+            } else {
+                Add-Chequeo 'Monitor' 'OK' "$res ($($v.Name))"
+            }
+        }
+    } catch {}
+
+    # RAM: XMP/EXPO y doble canal
+    try {
+        $dimms = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop)
+        $lentos = @($dimms | Where-Object { $_.Speed -and $_.ConfiguredClockSpeed -and $_.ConfiguredClockSpeed -lt $_.Speed })
+        $det = ($dimms | ForEach-Object { '{0} GB a {1} MHz' -f [Math]::Round($_.Capacity / 1GB), $_.ConfiguredClockSpeed }) -join ' + '
+        if ($lentos.Count -gt 0) {
+            Add-Chequeo 'RAM (XMP/EXPO)' 'REVISAR' "$det, pero los módulos dan $($lentos[0].Speed) MHz: activá XMP/EXPO en la BIOS."
+        } else {
+            Add-Chequeo 'RAM (XMP/EXPO)' 'OK' $det
+        }
+        if ($dimms.Count -eq 1) { Add-Chequeo 'RAM (canales)' 'REVISAR' 'Un solo módulo = canal simple. Con dos módulos los juegos ganan FPS mínimos.' }
+    } catch {}
+
+    # Plan de energía
+    $plan = Get-ActivePowerPlan
+    if ($plan -and @('381b4222-f694-41f0-9685-ff5bb260df2e', 'a1841308-3541-4fab-bc81-f71556f20b4a') -contains $plan.ToLower()) {
+        Add-Chequeo 'Plan de energía' 'REVISAR' 'Equilibrado/Economizador: estaciona núcleos. El modo gaming lo pasa a Alto rendimiento solo.'
+    } elseif ($plan) {
+        Add-Chequeo 'Plan de energía' 'OK' 'Plan de rendimiento activo.'
+    }
+
+    # Ajustes de Windows para juegos
+    $hags = Get-RegValueOrNull 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode'
+    if ($hags -eq 2)     { Add-Chequeo 'Programación de GPU por hardware' 'OK' 'Activa.' }
+    elseif ($hags -eq 1) { Add-Chequeo 'Programación de GPU por hardware' 'INFO' 'Apagada. Probá prenderla en Configuración > Pantalla > Gráficos y medí.' }
+
+    if ((Get-RegValueOrNull 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled') -eq 0) {
+        Add-Chequeo 'Modo de juego de Windows' 'REVISAR' 'Apagado. Prendelo en Configuración > Juegos > Modo de juego.'
+    } else {
+        Add-Chequeo 'Modo de juego de Windows' 'OK' 'Activo.'
+    }
+
+    if ((Get-RegValueOrNull 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled') -eq 0) {
+        Add-Chequeo 'Grabación de fondo (GameDVR)' 'OK' 'Apagada.'
+    } else {
+        Add-Chequeo 'Grabación de fondo (GameDVR)' 'REVISAR' "Windows graba gameplay de fondo. 'Optimizar PC' (página Pro) la apaga con backup."
+    }
+
+    if ([string](Get-RegValueOrNull 'HKCU:\Control Panel\Mouse' 'MouseSpeed') -eq '0') {
+        Add-Chequeo 'Aceleración del mouse' 'OK' 'Apagada.'
+    } else {
+        Add-Chequeo 'Aceleración del mouse' 'REVISAR' "Prendida. Apagala en Panel de control > Mouse > Opciones de puntero > 'Mejorar la precisión del puntero'."
+    }
+
+    # Seguridad basada en virtualización: se informa, no se toca
+    if ((Get-RegValueOrNull 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'Enabled') -eq 1) {
+        Add-Chequeo 'Integridad de memoria (VBS)' 'INFO' 'Activa: suele costar algunos FPS. Es un ajuste de seguridad y es decisión tuya; Booster no lo toca.'
+    }
+
+    # CPU híbrido
+    if ($script:CpuHibrido) {
+        $build = [Environment]::OSVersion.Version.Build
+        $txt = "$($script:CpuTopo[2]) núcleos P + $($script:CpuTopo[3]) núcleos E. "
+        if ($build -lt 22000) {
+            Add-Chequeo 'CPU híbrido' 'INFO' ($txt + "Windows 10 no reparte bien entre P y E: probá el toggle 'Solo P-cores' con el juego abierto y compará FPS.")
+        } else {
+            Add-Chequeo 'CPU híbrido' 'INFO' ($txt + "Windows 11 ya los reparte; 'Solo P-cores' es opcional, probalo por juego.")
+        }
+    }
+
+    # Disco del sistema
+    try {
+        $d = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction Stop
+        $pct = [Math]::Round($d.FreeSpace / $d.Size * 100)
+        $txt = '{0} {1:N0} GB libres ({2}%)' -f $env:SystemDrive, ($d.FreeSpace / 1GB), $pct
+        if ($pct -lt 15) { Add-Chequeo 'Disco del sistema' 'REVISAR' "$txt. Con poco espacio el SSD rinde peor: probá 'Limpiar basura'." }
+        else             { Add-Chequeo 'Disco del sistema' 'OK' $txt }
+    } catch {}
+
+    # Lo que Booster dejó pausado y los servers blindados
+    $pausados = @((Get-State).servicios | Where-Object { $_ } | Where-Object {
+        $s = Get-Service -Name $_ -ErrorAction SilentlyContinue
+        $s -and $s.Status -ne 'Running'
+    })
+    if ($pausados.Count -gt 0) {
+        Add-Chequeo 'Servicios pausados por Booster' 'INFO' ("{0} sin restaurar: {1}. 'Restaurar todo' los levanta." -f $pausados.Count, ($pausados -join ', '))
+    }
+    $blindados = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-Servidor $_.Name } | ForEach-Object { $_.Name } | Select-Object -Unique)
+    if ($blindados.Count -gt 0) {
+        Add-Chequeo 'Servers blindados' 'OK' ("Corriendo y protegidos: {0}. (Lista 'servidores' del config.json)" -f ($blindados -join ', '))
+    } else {
+        Add-Chequeo 'Servers blindados' 'OK' "Ninguno corriendo ahora. (Lista 'servidores' del config.json)"
+    }
+    return $r
+}
+
+# --- Medición del ruido de fondo (antes / después) ---
+$script:Metricas = @(
+    @{ K = 'cpuFondoPct'; N = 'CPU ocupada por el fondo';      F = '{0:N2} %';  MenorMejor = $true  },
+    @{ K = 'dpcPct';      N = 'Tiempo en DPC (drivers)';       F = '{0:N2} %';  MenorMejor = $true  },
+    @{ K = 'irqPct';      N = 'Tiempo en interrupciones';      F = '{0:N2} %';  MenorMejor = $true  },
+    @{ K = 'ctxSeg';      N = 'Cambios de contexto por seg';   F = '{0:N0}';    MenorMejor = $true  },
+    @{ K = 'procesos';    N = 'Procesos corriendo';            F = '{0:N0}';    MenorMejor = $true  },
+    @{ K = 'servicios';   N = 'Servicios corriendo';           F = '{0:N0}';    MenorMejor = $true  },
+    @{ K = 'ramLibreMB';  N = 'RAM libre';                     F = '{0:N0} MB'; MenorMejor = $false },
+    @{ K = 'pingMs';      N = 'Ping promedio (1.1.1.1)';       F = '{0:N1} ms'; MenorMejor = $true  },
+    @{ K = 'jitterMs';    N = 'Jitter';                        F = '{0:N1} ms'; MenorMejor = $true  },
+    @{ K = 'perdidaPct';  N = 'Paquetes perdidos';             F = '{0:N0} %';  MenorMejor = $true  }
+)
+
+function Get-RawPerf {
+    # Contadores crudos de WMI (no dependen del idioma de Windows). Con dos
+    # muestras se saca el promedio exacto del intervalo sin medir en el medio.
+    $c = Get-CimInstance Win32_PerfRawData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop
+    $s = Get-CimInstance Win32_PerfRawData_PerfOS_System -ErrorAction Stop
+    [pscustomobject]@{
+        T    = [double]$c.Timestamp_Sys100NS
+        Idle = [double]$c.PercentProcessorTime
+        Dpc  = [double]$c.PercentDPCTime
+        Irq  = [double]$c.PercentInterruptTime
+        Ctx  = [double]$s.ContextSwitchesPersec
+    }
+}
+
+function Get-Mediciones {
+    $vacio = [pscustomobject]@{ base = $null; ultima = $null }
+    if (-not (Test-Path $MedicionesPath)) { return $vacio }
+    try {
+        $m = Get-Content $MedicionesPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        foreach ($k in 'base', 'ultima') {
+            if ($m.PSObject.Properties.Name -notcontains $k) { $m | Add-Member -NotePropertyName $k -NotePropertyValue $null }
+        }
+        return $m
+    } catch { return $vacio }
+}
+
+function Invoke-Medicion([string]$modo) {
+    # $modo: 'base' (guarda el punto de partida) o 'comparar' (mide y compara con la base)
+    if ($script:Midiendo) { return }
+    if ($script:Sigilo) {
+        Write-Log 'Hay un juego abierto: la medición es del ruido de fondo, hacela con el juego cerrado.' 'warn'
+        return
+    }
+    $med = Get-Mediciones
+    if ($modo -eq 'comparar' -and -not $med.base) {
+        Write-Log "Primero tocá 'Medir base' (antes de aplicar el modo gaming)." 'warn'
+        return
+    }
+    $script:Midiendo = $true
+    $form.Cursor = 'WaitCursor'
+    try {
+        Write-Log 'Midiendo 15 segundos el ruido de fondo de la PC: no toques nada...' 'title'
+        $a = Get-RawPerf
+        $pings = @(); $perdidos = 0
+        $pg = New-Object System.Net.NetworkInformation.Ping
+        for ($i = 0; $i -lt 15; $i++) {
+            $t0 = Get-Date
+            try {
+                $rp = $pg.Send('1.1.1.1', 900)
+                if ($rp.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) { $pings += [int]$rp.RoundtripTime } else { $perdidos++ }
+            } catch { $perdidos++ }
+            while (((Get-Date) - $t0).TotalMilliseconds -lt 1000) {
+                Start-Sleep -Milliseconds 50
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+        }
+        $pg.Dispose()
+        $b  = Get-RawPerf
+        $dt = [Math]::Max(1, $b.T - $a.T)
+        $jit = 0.0
+        for ($i = 1; $i -lt $pings.Count; $i++) { $jit += [Math]::Abs($pings[$i] - $pings[$i - 1]) }
+        if ($pings.Count -gt 1) { $jit = $jit / ($pings.Count - 1) }
+
+        $m = [ordered]@{
+            fecha       = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+            cpuFondoPct = [Math]::Round([Math]::Max(0, (1 - ($b.Idle - $a.Idle) / $dt) * 100), 2)
+            dpcPct      = [Math]::Round(($b.Dpc - $a.Dpc) / $dt * 100, 2)
+            irqPct      = [Math]::Round(($b.Irq - $a.Irq) / $dt * 100, 2)
+            ctxSeg      = [Math]::Round(($b.Ctx - $a.Ctx) / ($dt / 10000000))
+            procesos    = @(Get-Process).Count
+            servicios   = @(Get-Service | Where-Object { $_.Status -eq 'Running' }).Count
+            ramLibreMB  = ([BoosterRam]::Query())[1]
+            pingMs      = if ($pings.Count -gt 0) { [Math]::Round(($pings | Measure-Object -Average).Average, 1) } else { 0 }
+            jitterMs    = [Math]::Round($jit, 1)
+            perdidaPct  = [Math]::Round($perdidos / 15 * 100)
+        }
+        if ($modo -eq 'base') { $med.base = $m; $med.ultima = $null } else { $med.ultima = $m }
+        ConvertTo-Json -InputObject $med -Depth 4 | Set-Content $MedicionesPath -Encoding UTF8
+
+        if ($modo -eq 'base') {
+            Write-Log ("Base guardada: fondo {0:N2}% de CPU, {1:N0} procesos, {2:N0} servicios, ping {3:N1} ms. Ahora aplicá el modo gaming y tocá 'Medir y comparar'." -f $m.cpuFondoPct, $m.procesos, $m.servicios, $m.pingMs) 'ok'
+        } else {
+            Write-Log 'Comparación lista: mirá la tabla de la página Diagnóstico.' 'ok'
+        }
+    } catch {
+        Write-Log "No se pudo medir: $($_.Exception.Message)" 'err'
+    } finally {
+        $script:Midiendo = $false
+        $form.Cursor = 'Default'
+    }
+    Invoke-Diagnostico -Silencioso
+}
+
+function Invoke-Diagnostico([switch]$Silencioso) {
+    $lvDiag.BeginUpdate()
+    $lvDiag.Items.Clear()
+    $revisar = 0
+    foreach ($c in (Get-Diagnostico)) {
+        $item = New-Object System.Windows.Forms.ListViewItem($c.Chequeo)
+        [void]$item.SubItems.Add($c.Estado)
+        [void]$item.SubItems.Add($c.Detalle)
+        $item.ToolTipText = $c.Detalle
+        $item.ForeColor = switch ($c.Estado) { 'OK' { $colGreen } 'REVISAR' { $colYellow } default { $colText } }
+        if ($c.Estado -eq 'REVISAR') { $revisar++ }
+        [void]$lvDiag.Items.Add($item)
+    }
+
+    # Filas de medición: base sola, o base -> después con veredicto
+    $med = Get-Mediciones
+    if ($med.base) {
+        foreach ($mt in $script:Metricas) {
+            $va = [double]$med.base.($mt.K)
+            $item = New-Object System.Windows.Forms.ListViewItem('MEDICIÓN · ' + $mt.N)
+            if ($med.ultima) {
+                $vb = [double]$med.ultima.($mt.K)
+                [void]$item.SubItems.Add((($mt.F -f $va) + '  →  ' + ($mt.F -f $vb)))
+                $dif = $vb - $va
+                # Cambios de menos del 5% (o ínfimos) son ruido de medición, no mejora
+                $piso = switch ($mt.K) {
+                    'cpuFondoPct' { 0.5 } 'dpcPct' { 0.1 } 'irqPct' { 0.1 } 'procesos' { 2 } 'servicios' { 1 }
+                    'ramLibreMB' { 200 } 'pingMs' { 1 } 'jitterMs' { 1 } 'perdidaPct' { 5 } default { 0.05 }
+                }
+                $ruido = [Math]::Max([Math]::Abs($va) * 0.05, $piso)
+                if ([Math]::Abs($dif) -le $ruido) {
+                    [void]$item.SubItems.Add('Igual (dentro del ruido de medición)')
+                    $item.ForeColor = $colDim
+                } else {
+                    $mejor = if ($mt.MenorMejor) { $dif -lt 0 } else { $dif -gt 0 }
+                    $pct = if ($va -ne 0) { ' ({0:+0;-0}%)' -f ($dif / $va * 100) } else { '' }
+                    [void]$item.SubItems.Add($(if ($mejor) { 'MEJOR' } else { 'PEOR' }) + $pct)
+                    $item.ForeColor = if ($mejor) { $colGreen } else { $colRed }
+                }
+            } else {
+                [void]$item.SubItems.Add(($mt.F -f $va))
+                [void]$item.SubItems.Add("Base del $($med.base.fecha). Aplicá el modo gaming y tocá 'Medir y comparar'.")
+                $item.ForeColor = $colBlue
+            }
+            [void]$lvDiag.Items.Add($item)
+        }
+    }
+    $lvDiag.EndUpdate()
+    if (-not $Silencioso) {
+        Write-Log $(if ($revisar -gt 0) { "Diagnóstico: $revisar punto(s) para revisar (en amarillo)." } else { 'Diagnóstico: todo lo que se puede chequear desde acá está en orden.' }) $(if ($revisar -gt 0) { 'warn' } else { 'ok' })
+    }
+}
+
+$lblDiag = New-Object System.Windows.Forms.Label
+$lblDiag.Text      = 'DIAGNÓSTICO — solo lectura: acá no se cambia nada'
+$lblDiag.Font      = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+$lblDiag.ForeColor = $colDim
+$lblDiag.Location  = New-Object System.Drawing.Point(0, 0)
+$lblDiag.AutoSize  = $true
+$pageDiag.Controls.Add($lblDiag)
+
+$lvDiag = New-Object System.Windows.Forms.ListView
+$lvDiag.Location         = New-Object System.Drawing.Point(0, 22)
+$lvDiag.Size             = New-Object System.Drawing.Size(1116, 400)
+$lvDiag.View             = 'Details'
+$lvDiag.FullRowSelect    = $true
+$lvDiag.ShowItemToolTips = $true
+$lvDiag.BackColor        = $colPanel
+$lvDiag.ForeColor        = $colText
+$lvDiag.BorderStyle      = 'None'
+[void]$lvDiag.Columns.Add('Chequeo', 270)
+[void]$lvDiag.Columns.Add('Estado', 230)
+[void]$lvDiag.Columns.Add('Detalle', 596)
+Set-DarkList $lvDiag
+$pageDiag.Controls.Add($lvDiag)
+
+$btnDiag = New-Btn 'Analizar de nuevo' 0 438 170 40 $colSurface $colText $pageDiag
+$btnDiag.Add_Click({ Invoke-Diagnostico })
+
+$btnMedBase = New-Btn 'Medir base (15 s)' 178 438 170 40 $colBlue $colDark $pageDiag
+$btnMedBase.Add_Click({ Invoke-Medicion 'base' })
+
+$btnMedCmp = New-Btn 'Medir y comparar (15 s)' 356 438 200 40 $colAccent $colDark $pageDiag
+$btnMedCmp.Add_Click({ Invoke-Medicion 'comparar' })
+
+$lblDiagHint = New-Object System.Windows.Forms.Label
+$lblDiagHint.Text      = "Medí la base, aplicá el modo gaming y medí de nuevo (sin juego abierto).`nMide el ruido de fondo que le roba al juego; menos del 5% de diferencia es ruido."
+$lblDiagHint.ForeColor = $colDim
+$lblDiagHint.Location  = New-Object System.Drawing.Point(572, 438)
+$lblDiagHint.Size      = New-Object System.Drawing.Size(544, 44)
+$pageDiag.Controls.Add($lblDiagHint)
+
+$btnTimerGlobal = New-ProRow 'Timer global (Win11)' 492 $colSurface $colText "Solo Windows 11: hace que el toggle 'Timer 0,5 ms' le llegue al juego y no solo a Booster (clave GlobalTimerResolutionRequests, con backup; pide reiniciar). En Windows 10 no existe. Se deshace con 'Revertir tweaks'."
+$btnTimerGlobal.Add_Click({ Enable-TimerGlobal })
+
 # ----- Registro (compartido entre páginas) -----
 $lblLog = New-Object System.Windows.Forms.Label
 $lblLog.Text      = 'REGISTRO'
@@ -1568,15 +2384,24 @@ $lblLog.Location  = New-Object System.Drawing.Point(24, 678)
 $lblLog.AutoSize  = $true
 $form.Controls.Add($lblLog)
 
+# El registro vive dentro de una tarjeta redondeada
+$logCard = New-Object System.Windows.Forms.Panel
+$logCard.Location  = New-Object System.Drawing.Point(24, 700)
+$logCard.Size      = New-Object System.Drawing.Size(1116, 100)
+$logCard.BackColor = $colPanel
+Set-Rounded $logCard 10
+$form.Controls.Add($logCard)
+
 $logBox = New-Object System.Windows.Forms.RichTextBox
-$logBox.Location    = New-Object System.Drawing.Point(24, 700)
-$logBox.Size        = New-Object System.Drawing.Size(1116, 100)
+$logBox.Location    = New-Object System.Drawing.Point(12, 8)
+$logBox.Size        = New-Object System.Drawing.Size(1098, 84)
 $logBox.ReadOnly    = $true
 $logBox.BackColor   = $colPanel
 $logBox.ForeColor   = $colText
 $logBox.BorderStyle = 'None'
 $logBox.Font        = New-Object System.Drawing.Font('Consolas', 9)
-$form.Controls.Add($logBox)
+$logBox.Add_HandleCreated({ [BoosterUi]::DarkScroll($this.Handle) })
+$logCard.Controls.Add($logBox)
 
 function Write-Log([string]$msg, [string]$kind = 'info') {
     $color = switch ($kind) {
@@ -1598,18 +2423,27 @@ function Update-Dashboard {
     $q = [BoosterRam]::Query()
     $script:TotalRamMB = $q[0]
     $usada = $q[0] - $q[1]
-    $script:TickNum++
     [void]$script:RamHist.Add([pscustomobject]@{ Tick = $script:TickNum; UsedMB = $usada })
     while ($script:RamHist.Count -gt $script:HistCap) { $script:RamHist.RemoveAt(0) }
 
-    # Ping por segundo (timeout corto para no trabar la interfaz)
-    $ms = 250
-    try {
-        $reply = $script:Pinger.Send('1.1.1.1', 250)
-        if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) { $ms = [int]$reply.RoundtripTime }
-    } catch {}
-    [void]$script:PingHist.Add([pscustomobject]@{ Tick = $script:TickNum; Ms = $ms })
-    while ($script:PingHist.Count -gt $script:HistCap) { $script:PingHist.RemoveAt(0) }
+    # Ping por segundo, ASÍNCRONO: se lanza en un tick y se lee en el siguiente,
+    # así la interfaz nunca se traba esperando la red. En modo sigilo (juego
+    # abierto) directamente no se pinguea.
+    if (-not $script:Sigilo) {
+        if ($script:PingTask -and $script:PingTask.IsCompleted) {
+            $ms = 250
+            try {
+                $reply = $script:PingTask.Result
+                if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) { $ms = [int]$reply.RoundtripTime }
+            } catch {}
+            $script:PingTask = $null
+            [void]$script:PingHist.Add([pscustomobject]@{ Tick = $script:TickNum; Ms = $ms })
+            while ($script:PingHist.Count -gt $script:HistCap) { $script:PingHist.RemoveAt(0) }
+        }
+        if (-not $script:PingTask) {
+            try { $script:PingTask = $script:Pinger.SendPingAsync('1.1.1.1', 250) } catch { $script:PingTask = $null }
+        }
+    }
 
     $lblCardUsada.Text = '{0:N1} GB' -f ($usada / 1024)
     $lblCardUsada.ForeColor = if ($q[2] -ge 85) { $colRed } elseif ($q[2] -ge 70) { $colYellow } else { $colAccent }
@@ -1624,7 +2458,8 @@ function Update-Dashboard {
         Clear-StandbyMemory
     }
 
-    if ($pageRecursos.Visible) {
+    # Solo se redibuja si de verdad se está mirando la página
+    if ($pageRecursos.Visible -and $form.Visible -and $form.WindowState -ne [System.Windows.Forms.FormWindowState]::Minimized) {
         $chartPanel.Invalidate()
         $pingPanel.Invalidate()
     }
@@ -1651,19 +2486,74 @@ function Update-GpuStats {
     } catch { $script:GpuOk = $false }
 }
 
-function Test-AutoGaming {
-    if (-not $chkAuto.Checked -or $script:BoostEnCurso) { return }
-    $juego = Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-InList $_.Name $Config.juegos } | Select-Object -First 1
-    if ($juego -and -not $script:JuegoDetectado) {
-        $script:JuegoDetectado = $true
-        # Perfil por juego: qué apps conservar para este juego puntual
-        $perfil = @($Config.perfiles) | Where-Object { $_ -and $juego.Name -like $_.juego } | Select-Object -First 1
-        $conservar = if ($perfil) { @($perfil.conservar) } else { @() }
-        $extra = if ($perfil) { " (perfil: conserva $($conservar -join ', '))" } else { '' }
-        Write-Log "Juego detectado: $($juego.Name)$extra" 'title'
-        Invoke-GamingMode -Silencioso -Conservar $conservar
-    } elseif (-not $juego) {
-        $script:JuegoDetectado = $false
+# ----- Vigía de juegos + modo sigilo -----
+# Con un juego abierto Booster se calla: nada de ping, nada de nvidia-smi,
+# nada de recorrer procesos, y el timer pasa de 1 a 5 segundos. Lo único
+# que sigue es leer la RAM (una llamada nativa) para la auto-purga.
+function Test-PidVivo([int]$id) {
+    # No abre un handle al proceso: anda aunque el anticheat lo proteja
+    try { [void][System.Diagnostics.Process]::GetProcessById($id); return $true } catch { return $false }
+}
+
+function Enter-Sigilo($juegos) {
+    $script:JuegoPids = @($juegos | ForEach-Object { $_.Id })
+    $nombre = $juegos[0].Name
+    if (-not $script:Sigilo) {
+        $script:Sigilo = $true
+        $script:PingTask = $null
+        $timerUI.Interval = 5000
+        $lblSub.Text      = "Modo sigilo: $nombre en curso"
+        $lblSub.ForeColor = $colGreen
+        Write-Log "Juego detectado: $nombre. Modo sigilo: dejo de medir ping/GPU y de recorrer procesos hasta que cierres." 'title'
+
+        if ($chkAuto.Checked -and -not $script:BoostEnCurso) {
+            # Perfil por juego: qué apps conservar para este juego puntual
+            $perfil = @($Config.perfiles) | Where-Object { $_ -and $nombre -like $_.juego } | Select-Object -First 1
+            $conservar = if ($perfil) { @($perfil.conservar | Where-Object { $_ }) } else { @() }
+            if ($conservar.Count -gt 0) { Write-Log "Perfil de ${nombre}: conserva $($conservar -join ', ')" 'info' }
+            Invoke-GamingMode -Silencioso -Conservar $conservar
+            return
+        }
+    }
+    if ($chkAuto.Checked) {
+        # Proceso nuevo del mismo juego (el launcher abrió el ejecutable real)
+        Set-GamePriority
+    } else {
+        # Sin auto-gaming: solo la afinidad, si está pedida
+        foreach ($p in $juegos) {
+            if (Test-QuierePCores $p.Name) { Set-GameAffinity $p $true }
+        }
+    }
+}
+
+function Exit-Sigilo {
+    $script:Sigilo    = $false
+    $script:JuegoPids = @()
+    $timerUI.Interval = 1000
+    $lblSub.Text      = 'Liberá tu PC después del trabajo'
+    $lblSub.ForeColor = $colDim
+    Write-Log "Juego cerrado: vuelvo al monitoreo normal. ('Restaurar todo' o Modo trabajo reactivan lo pausado.)" 'title'
+}
+
+function Update-GameWatch {
+    if ($script:BoostEnCurso) { return }
+    if ($script:Sigilo) {
+        $script:JuegoPids = @($script:JuegoPids | Where-Object { Test-PidVivo $_ })
+        if ($script:JuegoPids.Count -eq 0) { Exit-Sigilo }
+    }
+    $hayNuevo = $false
+    if ($script:WatchOk) {
+        # Camino barato: solo se mira lo que el evento de WMI avisó que arrancó
+        foreach ($n in [BoosterWatch]::Drain()) {
+            if (Test-InList $n $Config.juegos) { $hayNuevo = $true }
+        }
+    } elseif (-not $script:Sigilo -and ($script:TickNum % 5 -eq 0)) {
+        # Respaldo si el evento de WMI no está disponible: sondeo cada 5 s
+        $hayNuevo = $true
+    }
+    if ($hayNuevo) {
+        $juegos = Get-GameProcesses
+        if ($juegos.Count -gt 0) { Enter-Sigilo $juegos }
     }
 }
 
@@ -1685,17 +2575,21 @@ function Test-BoosterUpdate {
 $timerUI = New-Object System.Windows.Forms.Timer
 $timerUI.Interval = 1000
 $timerUI.Add_Tick({
+    # TickNum cuenta segundos: en sigilo el timer va cada 5 s y avanza de a 5
+    $script:TickNum += [int]($timerUI.Interval / 1000)
     Update-Dashboard
-    if ($script:TickNum % 5 -eq 0) { Test-AutoGaming }
-    if ($script:TickNum % 5 -eq 2) { Update-GpuStats }
-    if ($script:TickNum -eq 3)     { Test-BoosterUpdate }
+    Update-GameWatch
+    if (-not $script:Sigilo) {
+        if ($script:TickNum % 5 -eq 2) { Update-GpuStats }
+        if ($script:TickNum -eq 3)     { Test-BoosterUpdate }
+    }
 })
 
 # ----- Bandeja del sistema -----
-# Minimizar manda a Booster al lado del reloj: el timer de 0,5 ms,
+# Minimizar manda a Booster al lado del reloj:
 # el auto-gaming y la auto-purga siguen laburando en segundo plano.
 $notifyIcon = New-Object System.Windows.Forms.NotifyIcon
-$notifyIcon.Icon    = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $PSHOME 'powershell.exe'))
+$notifyIcon.Icon    = $script:BoosterIcon
 $notifyIcon.Text    = 'Booster'
 $notifyIcon.Visible = $true
 
@@ -1711,18 +2605,34 @@ $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$trayMenu.Items.Add('Purgar RAM caché', $null, { Clear-StandbyMemory })
 [void]$trayMenu.Items.Add('Restaurar todo', $null, { Restore-Services })
 [void]$trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-[void]$trayMenu.Items.Add('Salir', $null, { $form.Close() })
+[void]$trayMenu.Items.Add('Salir de Booster', $null, { $script:SalirDeVerdad = $true; $form.Close() })
 $notifyIcon.ContextMenuStrip = $trayMenu
 $notifyIcon.Add_DoubleClick({ Show-FromTray })
 
 $script:BalloonMostrado = $false
+$script:SalirDeVerdad   = $false
+
+function Hide-ToTray {
+    $form.Hide()
+    if (-not $script:BalloonMostrado) {
+        $script:BalloonMostrado = $true
+        $notifyIcon.ShowBalloonTip(2500, 'Booster', 'Sigo acá abajo, en los íconos ocultos: auto-gaming y auto-purga quedan activos. Doble clic para volver; clic derecho > Salir para cerrarme.', [System.Windows.Forms.ToolTipIcon]::Info)
+    }
+}
+
+# Minimizar manda a la bandeja...
 $form.Add_Resize({
-    if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) {
-        $form.Hide()
-        if (-not $script:BalloonMostrado) {
-            $script:BalloonMostrado = $true
-            $notifyIcon.ShowBalloonTip(2500, 'Booster', 'Sigo acá abajo: timer 0,5 ms, auto-gaming y auto-purga quedan activos. Doble clic para volver.', [System.Windows.Forms.ToolTipIcon]::Info)
-        }
+    if ($form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) { Hide-ToTray }
+})
+
+# ...y la X también (salvo 'cerrarALaBandeja: false' en el config). Para cerrar
+# de verdad: clic derecho en el ícono de la bandeja > Salir de Booster.
+$form.Add_FormClosing({
+    param($s, $e)
+    if (-not $script:SalirDeVerdad -and $Config.cerrarALaBandeja -and
+        $e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
+        $e.Cancel = $true
+        Hide-ToTray
     }
 })
 
@@ -1732,15 +2642,40 @@ $form.Add_Shown({
     Update-Dashboard
     Update-GpuStats
     $timerUI.Start()
-    Write-Log 'Booster v8 listo. Minimizá y quedo en la bandeja, al lado del reloj, laburando solo.' 'title'
+    Write-Log 'Booster v9 listo. Minimizá y quedo en la bandeja, al lado del reloj, laburando solo.' 'title'
+
+    # Vigía de juegos por evento (sin sondeo); si no está, se sondea cada 5 s
+    $script:WatchOk = $false
+    if ($script:WatchDisponible) { try { $script:WatchOk = [BoosterWatch]::Start() } catch {} }
+    if (-not $script:WatchOk) { Write-Log 'Aviso: no pude engancharme a los eventos de procesos; detecto juegos sondeando cada 5 s.' 'warn' }
+    if ($script:CpuHibrido) {
+        Write-Log ("CPU híbrido: {0} núcleos P + {1} núcleos E. El toggle 'Solo P-cores' fija los juegos a los P." -f $script:CpuTopo[2], $script:CpuTopo[3]) 'info'
+    }
+    $blindados = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-Servidor $_.Name } | ForEach-Object { $_.Name } | Select-Object -Unique)
+    if ($blindados.Count -gt 0) { Write-Log "Servers blindados corriendo (no se tocan): $($blindados -join ', ')" 'info' }
+
+    # Toggles que el config pide prendidos de entrada
+    if ($Config.soloPCores -and $script:CpuHibrido) { $chkPCores.Checked = $true }
+    if ($Config.autoGaming) { $chkAuto.Checked = $true }
+    if ($Config.timer05)    { $chkTimer.Checked = $true }
+
     Refresh-ServiceList
     Refresh-ProcessList
+    Invoke-Diagnostico -Silencioso
+
+    # Si ya hay un juego abierto al arrancar, sigilo de una
+    $yaJugando = Get-GameProcesses
+    if ($yaJugando.Count -gt 0) { Enter-Sigilo $yaJugando }
 })
 
 $form.Add_FormClosed({
     $timerUI.Stop()
+    try { [BoosterWatch]::Stop() } catch {}
     $notifyIcon.Visible = $false
     $notifyIcon.Dispose()
 })
 
-[void]$form.ShowDialog()
+# Application.Run y no ShowDialog: una ventana modal se CIERRA al ocultarla,
+# y por eso antes Booster moría al minimizarlo a la bandeja.
+[System.Windows.Forms.Application]::Run($form)
+if ($script:Mutex) { try { $script:Mutex.ReleaseMutex() } catch {}; $script:Mutex.Dispose() }

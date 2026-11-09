@@ -4,5 +4,7 @@
 .booster_net_backup.json
 # Backup de los tweaks persistentes (GameDVR, ahorro de energia)
 .booster_tweaks.json
+# Mediciones antes/despues de la pagina Diagnostico
+.booster_mediciones.json
 # Archivos puestos en cuarentena por Booster Rescate (NO subir: es malware)
 Cuarentena/
