@@ -212,5 +212,6 @@
   "autoGaming": false,
   "soloPCores": false,
   "timer05": false,
-  "cerrarALaBandeja": true
+  "cerrarALaBandeja": true,
+  "escalaUI": 0
 }

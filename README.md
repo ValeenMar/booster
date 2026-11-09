@@ -132,6 +132,8 @@ Los servicios solo se **pausan**, nunca se deshabilitan: al reiniciar Windows vu
 - El ping en vivo ahora es asíncrono (ya no puede trabar la interfaz).
 - **Interfaz renovada**: botones e interruptores con bordes suaves y estado al pasar el mouse, barra de título y listas en oscuro, ícono propio.
 - **Arreglado**: al minimizar a la bandeja Booster se cerraba.
+- **Se adapta a la pantalla**: se ve nítido con la escala de Windows al 125% o 150%, y si la ventana no entra (notebooks de 1366×768) se achica entera. Para forzar un tamaño: `"escalaUI": 0.85` (más chica) o `1.25` (más grande); `0` es automático.
+- **Notebooks**: a batería el modo gaming no cambia el plan de energía y avisa; *Optimizar PC* pregunta antes de apagar el ahorro de energía de USB/red; Diagnóstico marca si estás desenchufado.
 - El timer de 0,5 ms pasa a ser un toggle opcional, con **Timer global** para que en Windows 11 le llegue al juego.
 
 ## Novedades v8 ⚡
@@ -195,6 +197,8 @@ Todo se configura editando **`config.json`** con cualquier editor de texto:
 | `servidores` | Procesos que hosteás: **nunca** se cierran ni aparecen en el barrido |
 | `serviciosServidores` | Servicios que hosteás: **nunca** se pausan |
 | `autoGaming` / `soloPCores` / `timer05` | `true` para que el toggle arranque prendido |
+| `escalaUI` | Tamaño de la interfaz: `0` automático, `0.85` más chica, `1.25` más grande |
+| `cerrarALaBandeja` | `true`: la X manda a la bandeja; `false`: la X cierra |
 | `abrirEnTrabajo` | Apps que abre el botón Modo trabajo (rutas o nombres de .exe) |
 | `autoPurgaLibreMB` | Umbral de RAM libre (MB) que dispara la auto-purga |
 | `umbralRamMB` | RAM mínima (MB) para aparecer en la lista de tragones |

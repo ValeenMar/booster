@@ -33,6 +33,14 @@ if (-not $esAdmin) {
     exit
 }
 
+# Nitidez con escala de Windows (125%, 150%...): sin esto Windows estira la
+# ventana como una foto y se ve borrosa. Tiene que ir antes de crear ventanas;
+# el tamaño real lo ajusta después Invoke-UiScale.
+try {
+    Add-Type -Name Dpi -Namespace BoosterNative -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+    [void][BoosterNative.Dpi]::SetProcessDPIAware()
+} catch {}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -276,6 +284,7 @@ $defaultConfig = [ordered]@{
     soloPCores          = $false   # arrancar con Solo P-cores ya encendido (CPUs híbridas)
     timer05             = $false   # arrancar con Timer 0,5 ms ya encendido
     cerrarALaBandeja    = $true    # la X manda a la bandeja en vez de cerrar
+    escalaUI            = 0        # 0 = automática; ej. 0.85 más chica, 1.25 más grande
 }
 
 if (Test-Path $ConfigPath) {
@@ -691,7 +700,15 @@ function Optimize-System {
     }
 
     # Ahorro de energía de NIC y USB
-    if ($tweaks.PSObject.Properties.Name -notcontains 'ahorroDispositivos') {
+    $aplicarAhorro = $true
+    if ($tweaks.PSObject.Properties.Name -notcontains 'ahorroDispositivos' -and (Get-Alimentacion) -ne 'escritorio') {
+        # Notebook: este tweak cuesta batería, así que se pregunta
+        $resp = [System.Windows.Forms.MessageBox]::Show("Esta PC tiene batería.`n`nApagar el ahorro de energía de la placa de red y los puertos USB baja la latencia, pero gasta más batería cuando estás desenchufado.`n`n¿Aplicarlo igual?", 'Booster - Notebook', 'YesNo', 'Question')
+        $aplicarAhorro = ($resp -eq 'Yes')
+    }
+    if (-not $aplicarAhorro) {
+        Write-Log "Ahorro de energía de red/USB: lo dejé como estaba (notebook). Podés aplicarlo después tocando 'Optimizar PC' de nuevo." 'info'
+    } elseif ($tweaks.PSObject.Properties.Name -notcontains 'ahorroDispositivos') {
         $apagados = Disable-DevicePowerSaving
         $tweaks | Add-Member -NotePropertyName ahorroDispositivos -NotePropertyValue $apagados
         Write-Log ("Ahorro de energía desactivado en {0} dispositivo(s) de red/USB." -f @($apagados).Count) 'ok'
@@ -758,7 +775,21 @@ function Get-ActivePowerPlan {
     return $null
 }
 
+function Get-Alimentacion {
+    # 'escritorio' (sin batería), 'enchufada' o 'bateria'
+    try {
+        $ps = [System.Windows.Forms.SystemInformation]::PowerStatus
+        if ([int]$ps.BatteryChargeStatus -band [int][System.Windows.Forms.BatteryChargeStatus]::NoSystemBattery) { return 'escritorio' }
+        if ($ps.PowerLineStatus -eq [System.Windows.Forms.PowerLineStatus]::Offline) { return 'bateria' }
+        return 'enchufada'
+    } catch { return 'escritorio' }
+}
+
 function Enable-HighPerformance {
+    if ((Get-Alimentacion) -eq 'bateria') {
+        Write-Log 'Estás a batería: no cambio el plan de energía (Alto rendimiento la consume rápido). Enchufá el cargador para rendir al máximo.' 'warn'
+        return
+    }
     $actual = Get-ActivePowerPlan
     if (-not $actual) { return }
     # Solo se cambia si el plan actual es uno de los stock que frenan el CPU
@@ -1038,6 +1069,7 @@ function Show-StartupManager {
     $btnCerrar.DialogResult = 'Cancel'
     $dlg.Controls.Add($btnCerrar)
 
+    Invoke-UiScale $dlg
     if ($dlg.ShowDialog($form) -ne 'OK') { return }
     $cambios = 0
     foreach ($item in $lv.Items) {
@@ -1143,6 +1175,7 @@ function Show-KillPicker($items) {
     $dlg.AcceptButton = $btnOk
     $dlg.CancelButton = $btnCancel
 
+    Invoke-UiScale $dlg
     if ($dlg.ShowDialog($form) -eq 'OK') {
         return @($lv.CheckedItems | ForEach-Object { $_.Text })
     }
@@ -1309,6 +1342,65 @@ $script:uiBrHead   = New-Object System.Drawing.SolidBrush($colBg)
 $script:uiBrDim    = New-Object System.Drawing.SolidBrush($colDim)
 $script:uiPenLine  = New-Object System.Drawing.Pen($colSurface, 1)
 
+# --- Escala de la interfaz ---
+# Px    = factor de tamaño (DPI de Windows x ajuste a la pantalla x 'escalaUI')
+# FontK = factor de fuentes (el DPI no entra: Windows ya agranda los puntos solo)
+$script:Px    = 1.0
+$script:FontK = 1.0
+
+function Initialize-UiScale {
+    $dpi = 96.0
+    try { $g0 = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero); $dpi = $g0.DpiX; $g0.Dispose() } catch {}
+    $s = $dpi / 96.0
+    $user = 1.0
+    try { if ([double]$Config.escalaUI -gt 0) { $user = [Math]::Min(2.5, [Math]::Max(0.6, [double]$Config.escalaUI)) } } catch {}
+    # Si la ventana no entra en la pantalla (notebooks de 1366x768), se achica entera
+    $wa  = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $fit = [Math]::Min(1.0, [Math]::Min(($wa.Width - 8) / ($form.Width * $s * $user), ($wa.Height - 8) / ($form.Height * $s * $user)))
+    $fit = [Math]::Max(0.6, $fit)
+    $script:FontK = $fit * $user
+    $script:Px    = $s * $script:FontK
+    if ([Math]::Abs($script:Px - 1) -ge 0.01) {
+        $script:RowImgs.ImageSize = New-Object System.Drawing.Size(1, [int](26 * $script:Px))
+    }
+    if ([Math]::Abs($script:FontK - 1) -ge 0.01) {
+        $script:uiFontHead = New-Object System.Drawing.Font('Segoe UI Semibold', [single](8 * $script:FontK))
+    }
+}
+
+function Get-AllControls($root) {
+    foreach ($c in $root.Controls) { $c; Get-AllControls $c }
+}
+
+function Invoke-UiScale($root) {
+    # Lleva una ventana ya armada (coordenadas pensadas a 96 dpi) a la escala real
+    $hayPx   = [Math]::Abs($script:Px - 1) -ge 0.01
+    $hayFont = [Math]::Abs($script:FontK - 1) -ge 0.01
+    if (-not $hayPx -and -not $hayFont) { return }
+    if ($root -is [System.Windows.Forms.Form]) { $root.AutoScaleMode = 'None' }
+    $todos = @($root) + @(Get-AllControls $root)
+    # Foto de fuentes y columnas ANTES de tocar nada (las fuentes se heredan
+    # del padre: si se escalan en cadena, se escalan dos veces)
+    $fuentes = @{}; $columnas = @{}
+    foreach ($c in $todos) {
+        $fuentes[$c] = $c.Font
+        if ($c -is [System.Windows.Forms.ListView]) { $columnas[$c] = @($c.Columns | ForEach-Object { $_.Width }) }
+    }
+    if ($hayPx) { $root.Scale((New-Object System.Drawing.SizeF([single]$script:Px, [single]$script:Px))) }
+    foreach ($c in $todos) {
+        if ($hayFont) {
+            $f = $fuentes[$c]
+            $c.Font = New-Object System.Drawing.Font($f.FontFamily, [single]($f.Size * $script:FontK), $f.Style, $f.Unit)
+        }
+        if ($hayPx -and $c.Tag -is [hashtable] -and $c.Tag.ContainsKey('Radius')) {
+            $c.Tag.Radius = [int][Math]::Round($c.Tag.Radius * $script:Px)
+        }
+        if ($hayPx -and $columnas.ContainsKey($c)) {
+            for ($i = 0; $i -lt $c.Columns.Count; $i++) { $c.Columns[$i].Width = [int]($columnas[$c][$i] * $script:Px) }
+        }
+    }
+}
+
 function New-RoundPath([single]$x, [single]$y, [single]$w, [single]$h, [single]$r) {
     $d = [Math]::Min($r * 2, [Math]::Min($w, $h))
     $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
@@ -1371,15 +1463,16 @@ function Invoke-PaintControl($s, $g) {
             # Borde fino + interruptor a la izquierda
             $pen = New-Object System.Drawing.Pen($(if ($on) { $colAccent } else { $colSurface }), 1.2)
             $g.DrawPath($pen, $gp); $pen.Dispose()
-            $swW = 30; $swH = 16; $sx = 12; $sy = [int](($s.Height - $swH) / 2)
-            $sp = New-RoundPath $sx $sy $swW $swH 8
+            $k = $script:Px
+            $swW = 30 * $k; $swH = 16 * $k; $sx = 12 * $k; $sy = [int](($s.Height - $swH) / 2)
+            $sp = New-RoundPath $sx $sy $swW $swH (8 * $k)
             $sb = New-Object System.Drawing.SolidBrush($(if ($on) { $colAccent } else { $colSurface }))
             $g.FillPath($sb, $sp); $sb.Dispose(); $sp.Dispose()
-            $kx = if ($on) { $sx + $swW - $swH + 2 } else { $sx + 2 }
+            $kx = if ($on) { $sx + $swW - $swH + 2 * $k } else { $sx + 2 * $k }
             $kb = New-Object System.Drawing.SolidBrush($(if ($on) { $colDark } else { $colDim }))
-            $g.FillEllipse($kb, $kx, ($sy + 2), ($swH - 4), ($swH - 4)); $kb.Dispose()
+            $g.FillEllipse($kb, $kx, ($sy + 2 * $k), ($swH - 4 * $k), ($swH - 4 * $k)); $kb.Dispose()
             $tb = New-Object System.Drawing.SolidBrush($(if ($on) { $colText } else { $colDim }))
-            $tr = New-Object System.Drawing.RectangleF(($sx + $swW + 8), 0, ($s.Width - $sx - $swW - 14), $s.Height)
+            $tr = New-Object System.Drawing.RectangleF(($sx + $swW + 8 * $k), 0, ($s.Width - $sx - $swW - 14 * $k), $s.Height)
             $g.DrawString($s.Text, $s.Font, $tb, $tr, $script:sfLeft); $tb.Dispose()
         } else {
             $tb = New-Object System.Drawing.SolidBrush($s.ForeColor)
@@ -1776,9 +1869,13 @@ $script:UltimaAutoPurga  = -999
 $script:GpuOk            = $null -ne (Get-Command nvidia-smi -ErrorAction SilentlyContinue)
 
 # Recursos GDI creados una sola vez (crearlos en cada Paint filtra handles)
-$script:cFontCap  = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
-$script:cFontTiny = New-Object System.Drawing.Font('Segoe UI', 8)
-$script:cFontBig  = New-Object System.Drawing.Font('Segoe UI', 16, [System.Drawing.FontStyle]::Bold)
+# Fuentes de los gráficos en PÍXELES (no puntos): los gráficos se dibujan en
+# coordenadas lógicas y un ScaleTransform los lleva a la escala real, así que
+# la fuente no tiene que escalar por su cuenta con el DPI.
+$pxUnit = [System.Drawing.GraphicsUnit]::Pixel
+$script:cFontCap  = New-Object System.Drawing.Font('Segoe UI Semibold', 11.33, [System.Drawing.FontStyle]::Regular, $pxUnit)
+$script:cFontTiny = New-Object System.Drawing.Font('Segoe UI', 10.67, [System.Drawing.FontStyle]::Regular, $pxUnit)
+$script:cFontBig  = New-Object System.Drawing.Font('Segoe UI', 21.33, [System.Drawing.FontStyle]::Bold, $pxUnit)
 $script:cBrDim    = New-Object System.Drawing.SolidBrush($colDim)
 $script:cBrAccent = New-Object System.Drawing.SolidBrush($colAccent)
 $script:cBrGreen  = New-Object System.Drawing.SolidBrush($colGreen)
@@ -1809,7 +1906,10 @@ $chartPanel.Add_Paint({
     try {
         $g = $e.Graphics
         $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $W = $sender.ClientSize.Width; $H = $sender.ClientSize.Height
+        # Se dibuja en coordenadas lógicas (96 dpi) y se escala todo junto
+        $g.ScaleTransform($script:Px, $script:Px)
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+        $W = $sender.ClientSize.Width / $script:Px; $H = $sender.ClientSize.Height / $script:Px
         $padL = 18; $padR = 84; $padT = 46; $padB = 18
         $plotW = $W - $padL - $padR; $plotH = $H - $padT - $padB
 
@@ -1908,7 +2008,10 @@ $pingPanel.Add_Paint({
     try {
         $g = $e.Graphics
         $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-        $W = $sender.ClientSize.Width; $H = $sender.ClientSize.Height
+        # Se dibuja en coordenadas lógicas (96 dpi) y se escala todo junto
+        $g.ScaleTransform($script:Px, $script:Px)
+        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+        $W = $sender.ClientSize.Width / $script:Px; $H = $sender.ClientSize.Height / $script:Px
         $padL = 18; $padR = 84; $padT = 46; $padB = 12
         $plotW = $W - $padL - $padR; $plotH = $H - $padT - $padB
 
@@ -2145,6 +2248,12 @@ function Get-Diagnostico {
         } else {
             Add-Chequeo 'CPU híbrido' 'INFO' ($txt + "Windows 11 ya los reparte; 'Solo P-cores' es opcional, probalo por juego.")
         }
+    }
+
+    # Notebook: a batería Windows y el fabricante limitan CPU y GPU
+    switch (Get-Alimentacion) {
+        'bateria'   { Add-Chequeo 'Alimentación' 'REVISAR' 'Estás a batería: la notebook limita el rendimiento y el modo gaming no cambia el plan de energía. Enchufá el cargador para jugar.' }
+        'enchufada' { Add-Chequeo 'Alimentación' 'OK' 'Notebook enchufada.' }
     }
 
     # Disco del sistema
@@ -2654,6 +2763,9 @@ $form.Add_Shown({
     $blindados = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { Test-Servidor $_.Name } | ForEach-Object { $_.Name } | Select-Object -Unique)
     if ($blindados.Count -gt 0) { Write-Log "Servers blindados corriendo (no se tocan): $($blindados -join ', ')" 'info' }
 
+    if ((Get-Alimentacion) -eq 'bateria') { Write-Log 'Notebook a batería: enchufá el cargador para rendir al máximo.' 'warn' }
+    if (-not $script:GpuOk) { $lblCardGpu.Text = 'Solo NVIDIA'; $lblCardVram.Text = 'Solo NVIDIA' }
+
     # Toggles que el config pide prendidos de entrada
     if ($Config.soloPCores -and $script:CpuHibrido) { $chkPCores.Checked = $true }
     if ($Config.autoGaming) { $chkAuto.Checked = $true }
@@ -2674,6 +2786,10 @@ $form.Add_FormClosed({
     $notifyIcon.Visible = $false
     $notifyIcon.Dispose()
 })
+
+# Con toda la ventana armada, se la lleva a la escala de esta PC
+Initialize-UiScale
+Invoke-UiScale $form
 
 # Application.Run y no ShowDialog: una ventana modal se CIERRA al ocultarla,
 # y por eso antes Booster moría al minimizarlo a la bandeja.
